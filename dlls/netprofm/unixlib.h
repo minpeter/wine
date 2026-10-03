@@ -1,7 +1,5 @@
 /*
- * COM Classes for netprofm
- *
- * Copyright 2014 Hans Leidekker for CodeWeavers
+ * Copyright 2026 Peter Min
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -18,6 +16,43 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#pragma makedep regtypelib
+#ifndef __WINE_NETPROFM_UNIXLIB_H
+#define __WINE_NETPROFM_UNIXLIB_H
 
-#include "netlistmgr.idl"
+enum reachability_state
+{
+    REACHABILITY_INDETERMINATE,
+    REACHABILITY_OFFLINE,
+    REACHABILITY_ONLINE,
+};
+
+struct reachability_start_params
+{
+    UINT64 handle;
+    UINT32 state;
+};
+
+struct reachability_wait_params
+{
+    UINT64 handle;
+    UINT32 state;
+    UINT32 changed;
+};
+
+struct reachability_stop_params
+{
+    UINT64 handle;
+};
+
+enum unix_funcs
+{
+    unix_reachability_start,
+    unix_reachability_wait,
+    unix_reachability_stop,
+    unix_funcs_count,
+};
+
+#define UNIX_CALL(func, params) \
+    (__wine_unixlib_handle ? WINE_UNIX_CALL( unix_##func, params ) : STATUS_NOT_SUPPORTED)
+
+#endif /* __WINE_NETPROFM_UNIXLIB_H */
