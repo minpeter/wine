@@ -1959,16 +1959,25 @@ static BOOL has_ipv4_address( const IP_ADAPTER_ADDRESSES *aa )
     return FALSE;
 }
 
-static BOOL has_ipv4_gateway_address( const IP_ADAPTER_ADDRESSES *aa )
+static BOOL has_ipv4_default_route( const IP_ADAPTER_ADDRESSES *aa )
 {
-    const IP_ADAPTER_GATEWAY_ADDRESS *addr = aa->FirstGatewayAddress;
-    while (addr)
+    struct nsi_ipv4_forward_key *keys;
+    DWORD count, err, i;
+    BOOL ret = FALSE;
+
+    err = NsiAllocateAndGetTable( 1, &npi_ipv4_module, NSI_IP_FORWARD_TABLE,
+                                  (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
+    if (err) return FALSE;
+    for (i = 0; i < count; i++)
     {
-        if (addr->Address.lpSockaddr->sa_family == AF_INET)
-            return TRUE;
-        addr = addr->Next;
+        if (keys[i].luid.Value == aa->Luid.Value && !keys[i].prefix_len && keys[i].next_hop.s_addr)
+        {
+            ret = TRUE;
+            break;
+        }
     }
-    return FALSE;
+    NsiFreeTable( keys, NULL, NULL, NULL );
+    return ret;
 }
 
 static BOOL has_ipv6_default_route( const IP_ADAPTER_ADDRESSES *aa )
@@ -2055,7 +2064,7 @@ static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
             connected_v6 = has_local || has_global;
             internet_v6 = has_global && has_ipv6_default_route( aa );
             connected_v4 = has_ipv4_address( aa );
-            internet_v4 = has_ipv4_gateway_address( aa );
+            internet_v4 = connected_v4 && has_ipv4_default_route( aa );
         }
 
         network->connected_v4 = connected_v4 ? VARIANT_TRUE : VARIANT_FALSE;
@@ -2104,7 +2113,7 @@ static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
             network->connected_v4 = connection->connected_v4 =
                     has_ipv4_address( aa ) ? VARIANT_TRUE : VARIANT_FALSE;
             network->connected_to_internet_v4 = connection->connected_to_internet_v4 =
-                    has_ipv4_gateway_address( aa ) ? VARIANT_TRUE : VARIANT_FALSE;
+                    network->connected_v4 && has_ipv4_default_route( aa ) ? VARIANT_TRUE : VARIANT_FALSE;
         }
         list_add_tail( &mgr->networks, &network->entry );
         list_add_tail( &mgr->connections, &connection->entry );
@@ -2390,7 +2399,7 @@ static void init_networks( struct list_manager *mgr )
             network->connected_v4 = VARIANT_TRUE;
             connection->connected_v4 = VARIANT_TRUE;
         }
-        if (aa->OperStatus == IfOperStatusUp && has_ipv4_gateway_address( aa ))
+        if (aa->OperStatus == IfOperStatusUp && network->connected_v4 && has_ipv4_default_route( aa ))
         {
             network->connected_to_internet_v4 = VARIANT_TRUE;
             connection->connected_to_internet_v4 = VARIANT_TRUE;

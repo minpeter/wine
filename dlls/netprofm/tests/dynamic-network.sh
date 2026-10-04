@@ -19,6 +19,21 @@ run_gid=${4-}
 marker_dir=/tmp/wine-netprofm-dynamic
 prefix=/tmp/wine-netprofm-prefix
 log=/tmp/wine-netprofm-dynamic.log
+test_dir=$build_dir/dlls/netprofm/tests
+test_exe=
+
+for candidate in "$test_dir/netprofm_test.exe.so" "$test_dir/netprofm_test.exe" \
+        "$test_dir/x86_64-windows/netprofm_test.exe" "$test_dir"/*-windows/netprofm_test.exe
+do
+    if [ -f "$candidate" ]; then
+        test_exe=$candidate
+        break
+    fi
+done
+if [ -z "$test_exe" ]; then
+    echo "could not find the netprofm test executable under $test_dir" >&2
+    exit 1
+fi
 
 rm -rf "$marker_dir" "$prefix" "$log"
 mkdir -p "$marker_dir" "$prefix"
@@ -38,10 +53,10 @@ if [ -n "$run_uid" ]; then
     run_home=$(getent passwd "$run_uid" | cut -d: -f6)
     setpriv --reuid="$run_uid" --regid="$run_gid" --init-groups env HOME="$run_home" \
         WINETEST_NETPROFM_DYNAMIC_DIR='Z:\tmp\wine-netprofm-dynamic' WINEPREFIX="$prefix" \
-        "$build_dir/wine" "$build_dir/dlls/netprofm/tests/netprofm_test.exe.so" list >"$log" 2>&1 &
+        "$build_dir/wine" "$test_exe" list >"$log" 2>&1 &
 else
     WINETEST_NETPROFM_DYNAMIC_DIR='Z:\tmp\wine-netprofm-dynamic' WINEPREFIX="$prefix" \
-        "$build_dir/wine" "$build_dir/dlls/netprofm/tests/netprofm_test.exe.so" list >"$log" 2>&1 &
+        "$build_dir/wine" "$test_exe" list >"$log" 2>&1 &
 fi
 test_pid=$!
 
@@ -68,6 +83,7 @@ wait_marker initial_no_ipv6_route
 ip -6 route add default via 2001:db8::1 dev nlm0 onlink
 touch "$marker_dir/initial_ipv6_route_added"
 wait_marker ready
+ip route add 198.51.100.0/24 via 192.0.2.1 dev nlm0
 ip route del default
 wait_marker route_removed
 ip route add default via 192.0.2.1 dev nlm0

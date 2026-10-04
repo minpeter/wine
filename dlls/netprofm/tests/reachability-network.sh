@@ -22,6 +22,21 @@ prefix=/tmp/wine-netprofm-reachability-prefix
 log=/tmp/wine-netprofm-reachability.log
 bus_info=/tmp/wine-netprofm-reachability-bus
 bus_socket=/tmp/wine-netprofm-reachability-bus.sock
+test_dir=$build_dir/dlls/netprofm/tests
+test_exe=
+
+for candidate in "$test_dir/netprofm_test.exe.so" "$test_dir/netprofm_test.exe" \
+        "$test_dir/x86_64-windows/netprofm_test.exe" "$test_dir"/*-windows/netprofm_test.exe
+do
+    if [ -f "$candidate" ]; then
+        test_exe=$candidate
+        break
+    fi
+done
+if [ -z "$test_exe" ]; then
+    echo "could not find the netprofm test executable under $test_dir" >&2
+    exit 1
+fi
 
 rm -rf "$marker_dir" "$prefix" "$log" "$bus_info" "$bus_socket"
 mkdir -p "$marker_dir" "$prefix"
@@ -124,11 +139,11 @@ if [ -n "$run_uid" ]; then
     setpriv --reuid="$run_uid" --regid="$run_gid" --init-groups env HOME="$run_home" \
         DBUS_SYSTEM_BUS_ADDRESS="$bus_address" \
         WINETEST_NETPROFM_REACHABILITY_DIR='Z:\tmp\wine-netprofm-reachability' WINEPREFIX="$prefix" \
-        "$build_dir/wine" "$build_dir/dlls/netprofm/tests/netprofm_test.exe.so" list >"$log" 2>&1 &
+        "$build_dir/wine" "$test_exe" list >"$log" 2>&1 &
 else
     env DBUS_SYSTEM_BUS_ADDRESS="$bus_address" \
         WINETEST_NETPROFM_REACHABILITY_DIR='Z:\tmp\wine-netprofm-reachability' WINEPREFIX="$prefix" \
-        "$build_dir/wine" "$build_dir/dlls/netprofm/tests/netprofm_test.exe.so" list >"$log" 2>&1 &
+        "$build_dir/wine" "$test_exe" list >"$log" 2>&1 &
 fi
 test_pid=$!
 

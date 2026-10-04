@@ -638,7 +638,7 @@ static void test_dynamic_connectivity( const char *marker_dir )
     IEnumNetworks *networks;
     INetworkListManager *mgr;
     INetwork *network, *same_network;
-    NLM_CONNECTIVITY initial, without_ipv4, without_ipv6_internet, current;
+    NLM_CONNECTIVITY initial, without_ipv4, without_ipv4_internet, without_ipv6_internet, current;
     GUID id;
     DWORD cookie;
     HRESULT hr;
@@ -694,9 +694,10 @@ static void test_dynamic_connectivity( const char *marker_dir )
         "expected initial IPv6 Internet connectivity, value %#x\n", initial );
     write_marker( marker_dir, "ready" );
 
-    ok( wait_for_connectivity( mgr, initial, FALSE, &current ),
-        "route removal did not change connectivity, value %#x\n", current );
-    ok( current != NLM_CONNECTIVITY_DISCONNECTED, "route removal lost local connectivity\n" );
+    without_ipv4_internet = initial & ~NLM_CONNECTIVITY_IPV4_INTERNET;
+    without_ipv4_internet |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
+    ok( wait_for_connectivity( mgr, without_ipv4_internet, TRUE, &current ),
+        "IPv4 default route removal did not remove IPv4 Internet connectivity, value %#x\n", current );
     write_marker( marker_dir, "route_removed" );
     ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
         "route restoration did not restore connectivity, value %#x\n", current );
