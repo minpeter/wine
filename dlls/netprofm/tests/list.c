@@ -869,6 +869,7 @@ static void test_reachability( const char *marker_dir )
     IConnectionPoint *connection_point;
     INetworkListManager *mgr, *second_mgr;
     NLM_CONNECTIVITY initial, local, current;
+    char activation_marker[MAX_PATH];
     DWORD cookie;
     HRESULT hr;
 
@@ -881,6 +882,15 @@ static void test_reachability( const char *marker_dir )
     ok( hr == S_OK, "GetConnectivity failed, hr %#lx\n", hr );
     ok( initial & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET),
         "expected initial Internet connectivity, got %#x\n", initial );
+    /* Exercise indeterminate-state retries as well as the initial GetAll. */
+    Sleep( 2200 );
+    hr = INetworkListManager_GetConnectivity( mgr, &current );
+    ok( hr == S_OK && current == initial, "stopped service changed connectivity to %#x\n", current );
+    snprintf( activation_marker, sizeof(activation_marker), "%s/activated", marker_dir );
+    ok( GetFileAttributesA( activation_marker ) == INVALID_FILE_ATTRIBUTES,
+        "NLM activated the stopped NetworkManager service\n" );
+    write_marker( marker_dir, "passive" );
+    ok( wait_for_marker( marker_dir, "service-ready" ), "explicit service startup timed out\n" );
     local = initial;
     if (local & NLM_CONNECTIVITY_IPV4_INTERNET)
     {

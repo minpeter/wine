@@ -67,6 +67,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(netprofm);
     DO_FUNC(dbus_message_iter_next);                    \
     DO_FUNC(dbus_message_iter_recurse);                 \
     DO_FUNC(dbus_message_new_method_call);              \
+    DO_FUNC(dbus_message_set_auto_start);               \
     DO_FUNC(dbus_message_unref);                        \
     DO_FUNC(dbus_threads_init_default)
 
@@ -138,6 +139,8 @@ static enum reachability_state read_reachability( struct reachability_context *c
 
     request = p_dbus_message_new_method_call( service, path, properties, "GetAll" );
     if (!request) return REACHABILITY_INDETERMINATE;
+    /* The provider observes an existing service; it must never activate one. */
+    p_dbus_message_set_auto_start( request, FALSE );
     p_dbus_message_iter_init_append( request, &iter );
     name = interface;
     p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &name );

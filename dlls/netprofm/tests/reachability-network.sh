@@ -76,6 +76,9 @@ cleanup()
 {
     [ -z "$test_pid" ] || kill "$test_pid" 2>/dev/null || true
     [ -z "$service_pid" ] || kill "$service_pid" 2>/dev/null || true
+    if [ -s "$marker_dir/activated" ]; then
+        kill "$(cat "$marker_dir/activated")" 2>/dev/null || true
+    fi
     [ -z "$bus_pid" ] || kill "$bus_pid" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -90,11 +93,45 @@ run_as_user()
     fi
 }
 
+# Prefix bootstrap can exceed the marker deadline, particularly under WoW64.
+# Finish it before starting the activation bus and timed test exchanges.
+run_as_user env WINEPREFIX="$prefix" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$marker_dir/no-bus" \
+    "$build_dir/wine" wineboot --init >"$log" 2>&1
+run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w
+
 bus_address="unix:path=$bus_socket"
+# Install an activatable but initially stopped service on a private bus. The
+# wrapper records process startup, even if name acquisition or GetAll fails.
+mkdir "$marker_dir/services"
+cat >"$marker_dir/activate" <<EOF
+#!/bin/sh
+echo \$\$ >"$marker_dir/activated"
+export DBUS_SYSTEM_BUS_ADDRESS="$bus_address"
+exec /usr/bin/python3 "$source_dir/fake-networkmanager.py" \\
+    "$marker_dir/activation-command" "$marker_dir/activation-ready" FULL 1 1
+EOF
+chmod 755 "$marker_dir/activate"
+cat >"$marker_dir/services/org.freedesktop.NetworkManager.service" <<EOF
+[D-BUS Service]
+Name=org.freedesktop.NetworkManager
+Exec=$marker_dir/activate
+EOF
+cat >"$marker_dir/bus.conf" <<EOF
+<busconfig>
+  <type>session</type>
+  <listen>$bus_address</listen>
+  <servicedir>$marker_dir/services</servicedir>
+  <policy context="default">
+    <allow send_destination="*"/>
+    <allow receive_sender="*"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
 start_bus()
 {
     rm -f "$bus_info" "$bus_socket"
-    run_as_user dbus-daemon --session --address="$bus_address" --fork \
+    run_as_user dbus-daemon --config-file="$marker_dir/bus.conf" --fork \
         --print-address=1 --print-pid=1 >"$bus_info"
     bus_pid=$(sed -n '2p' "$bus_info")
 }
@@ -151,7 +188,19 @@ set_state()
     wait_marker "ack-$serial"
 }
 
-start_service service-ready FULL
+# Positive control: the same ordinary GetAll request must activate the service.
+run_as_user dbus-send --bus="$bus_address" --print-reply \
+    --dest=org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+    org.freedesktop.DBus.Properties.GetAll string:org.freedesktop.NetworkManager
+wait_marker activation-ready
+test -s "$marker_dir/activated"
+kill "$(cat "$marker_dir/activated")"
+# Restart the bus to guarantee the activatable service has no owner.
+kill "$bus_pid"
+bus_pid=
+start_bus
+rm -f "$marker_dir/activated" "$marker_dir/activation-ready"
+echo "activation control passed; starting NLM with NetworkManager stopped"
 if [ -n "$run_uid" ]; then
     run_home=$(getent passwd "$run_uid" | cut -d: -f6)
     setpriv --reuid="$run_uid" --regid="$run_gid" --init-groups env HOME="$run_home" \
@@ -165,6 +214,9 @@ else
 fi
 test_pid=$!
 
+wait_marker passive
+test ! -e "$marker_dir/activated"
+start_service service-ready FULL
 wait_marker ready
 set_state 1 LIMITED 1 1
 wait_marker limited
@@ -179,6 +231,8 @@ kill "$service_pid"
 wait "$service_pid" || true
 service_pid=
 wait_marker stopped
+sleep 2
+test ! -e "$marker_dir/activated"
 rm -f "$marker_dir/command"
 start_service service-restarted PORTAL
 wait_marker restarted
@@ -195,6 +249,8 @@ wait "$service_pid" 2>/dev/null || true
 service_pid=
 rm -f "$marker_dir/command"
 start_bus
+sleep 2
+test ! -e "$marker_dir/activated"
 start_service bus-service-restarted PORTAL
 wait_marker bus_restarted
 set_state 7 FULL 1 1
@@ -204,4 +260,6 @@ if ! wait "$test_pid"; then
     exit 1
 fi
 test_pid=
+test ! -e "$marker_dir/activated"
+echo "passive activation checks passed (startup, owner loss, reconnect)"
 cat "$log"
