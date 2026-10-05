@@ -1,5 +1,5 @@
 TESTDLL   = netprofm.dll
-IMPORTS   = iphlpapi oleaut32 ole32 user32
+IMPORTS   = iphlpapi nsi oleaut32 ole32 user32
 
 SOURCES = \
 	list.c

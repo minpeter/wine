@@ -1986,7 +1986,7 @@ static enum default_route_state get_ipv6_default_route( const IP_ADAPTER_ADDRESS
     DWORD count, err, i;
     enum default_route_state ret = DEFAULT_ROUTE_ABSENT;
 
-    err = NsiAllocateAndGetTable( 1, &npi_ipv6_module, NSI_IP_FORWARD_TABLE,
+    err = NsiAllocateAndGetTable( 1, &npi_ipv6_module, NSI_WINE_IPV6_FORWARD_TABLE_STRICT,
                                   (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
     if (err) return DEFAULT_ROUTE_UNAVAILABLE;
     for (i = 0; i < count; i++)

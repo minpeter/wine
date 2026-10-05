@@ -2,12 +2,17 @@
 set -eu
 
 if [ "${1-}" != "--inside" ]; then
-    build_dir=${1:?usage: $0 BUILD_DIR}
+    build_dir=${1:?usage: $0 BUILD_DIR [TEST_EXE]}
+    test_exe=${2-}
+    if [ -n "$test_exe" ] && [ ! -f "$test_exe" ]; then
+        echo "test executable not found: $test_exe" >&2
+        exit 1
+    fi
     if unshare --user --map-root-user --net true 2>/dev/null; then
-        exec unshare --user --map-root-user --net "$0" --inside "$build_dir"
+        exec unshare --user --map-root-user --net "$0" --inside "$build_dir" "" "" "$test_exe"
     fi
     if command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
-        exec sudo unshare --net "$0" --inside "$build_dir" "$(id -u)" "$(id -g)"
+        exec sudo unshare --net "$0" --inside "$build_dir" "$(id -u)" "$(id -g)" "$test_exe"
     fi
     echo "unprivileged user/network namespaces are unavailable" >&2
     exit 1
@@ -22,7 +27,7 @@ log=/tmp/wine-netprofm-dynamic.log
 test_dir=$build_dir/dlls/netprofm/tests
 test_exe=
 
-for candidate in "$test_dir/netprofm_test.exe.so" "$test_dir/netprofm_test.exe" \
+for candidate in "${5-}" "$test_dir/netprofm_test.exe.so" "$test_dir/netprofm_test.exe" \
         "$test_dir/x86_64-windows/netprofm_test.exe" "$test_dir"/*-windows/netprofm_test.exe
 do
     if [ -f "$candidate" ]; then

@@ -25,10 +25,14 @@
 #include "initguid.h"
 #include "iphlpapi.h"
 #include "iptypes.h"
+#include "netioapi.h"
+#define __WINE_INIT_NPI_MODULEID
+#include "netiodef.h"
 #include "objbase.h"
 #include "ocidl.h"
 #include "olectl.h"
 #include "netlistmgr.h"
+#include "wine/nsi.h"
 #include "wine/test.h"
 #include "../netprofm_private.h"
 
@@ -997,17 +1001,122 @@ static void test_reachability( const char *marker_dir )
     }
 }
 
+static void test_ipv6_route_availability( BOOL unavailable )
+{
+    static const ULONG families[] = {AF_UNSPEC, AF_INET6};
+    const ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_DNS_SERVER;
+    IP_ADAPTER_ADDRESSES *addresses, *adapter;
+    IP_ADAPTER_UNICAST_ADDRESS *address;
+    struct nsi_ipv6_forward_key *keys;
+    MIB_IPFORWARD_TABLE2 *routes;
+    INetworkListManager *mgr;
+    NLM_CONNECTIVITY connectivity, expected;
+    BOOL found, ipv4, ipv6;
+    DWORD count, err;
+    ULONG size, i, j;
+    HRESULT hr;
+
+    trace( "IPv6 route source %s\n", unavailable ? "unavailable" : "empty" );
+    count = 0;
+    err = NsiEnumerateObjectsAllParameters( 1, 0, &NPI_MS_IPV6_MODULEID,
+                                            NSI_WINE_IPV6_FORWARD_TABLE_STRICT,
+                                            NULL, 0, NULL, 0, NULL, 0, NULL, 0, &count );
+    ok( err == (unavailable ? ERROR_NOT_SUPPORTED : ERROR_SUCCESS),
+        "strict enumeration returned %lu\n", err );
+    if (!err) ok( !count, "strict enumeration returned %lu rows\n", count );
+
+    count = 0;
+    err = NsiEnumerateObjectsAllParameters( 1, 0, &NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE,
+                                            NULL, 0, NULL, 0, NULL, 0, NULL, 0, &count );
+    ok( !err && !count, "public count query returned %lu, count %lu\n", err, count );
+    err = NsiAllocateAndGetTable( 1, &NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE,
+                                  (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
+    ok( !err, "public enumeration returned %lu\n", err );
+    if (!err)
+    {
+        ok( !count, "public enumeration returned %lu rows\n", count );
+        NsiFreeTable( keys, NULL, NULL, NULL );
+    }
+
+    for (i = 0; i < ARRAY_SIZE(families); i++)
+    {
+        winetest_push_context( "family %lu", families[i] );
+        size = 0;
+        err = GetAdaptersAddresses( families[i], flags, NULL, NULL, &size );
+        ok( err == ERROR_BUFFER_OVERFLOW && size, "adapter sizing returned %lu, size %lu\n", err, size );
+        if (err == ERROR_BUFFER_OVERFLOW && (addresses = malloc( size )))
+        {
+            err = GetAdaptersAddresses( families[i], flags, NULL, addresses, &size );
+            ok( !err, "adapter enumeration returned %lu\n", err );
+            if (!err)
+            {
+                found = ipv4 = ipv6 = FALSE;
+                for (adapter = addresses; adapter; adapter = adapter->Next)
+                {
+                    if (wcscmp( adapter->FriendlyName, L"nlm0" )) continue;
+                    found = TRUE;
+                    for (address = adapter->FirstUnicastAddress; address; address = address->Next)
+                    {
+                        if (address->Address.lpSockaddr->sa_family == AF_INET) ipv4 = TRUE;
+                        if (address->Address.lpSockaddr->sa_family == AF_INET6)
+                        {
+                            const struct sockaddr_in6 *addr = (const struct sockaddr_in6 *)address->Address.lpSockaddr;
+                            if (addr->sin6_addr.s6_addr[0] == 0x20 && addr->sin6_addr.s6_addr[1] == 0x01)
+                                ipv6 = TRUE;
+                        }
+                    }
+                }
+                ok( found, "nlm0 missing from adapters\n" );
+                ok( ipv4 == (families[i] == AF_UNSPEC), "unexpected IPv4 address presence %d\n", ipv4 );
+                ok( ipv6, "global IPv6 address missing\n" );
+            }
+            free( addresses );
+        }
+
+        err = GetIpForwardTable2( families[i], &routes );
+        ok( !err, "GetIpForwardTable2 returned %lu\n", err );
+        if (!err)
+        {
+            ipv4 = ipv6 = FALSE;
+            for (j = 0; j < routes->NumEntries; j++)
+            {
+                if (routes->Table[j].DestinationPrefix.Prefix.si_family == AF_INET6) ipv6 = TRUE;
+                if (routes->Table[j].DestinationPrefix.Prefix.si_family == AF_INET &&
+                    !routes->Table[j].DestinationPrefix.PrefixLength) ipv4 = TRUE;
+            }
+            ok( !ipv6, "unexpected IPv6 routes\n" );
+            ok( ipv4 == (families[i] == AF_UNSPEC), "unexpected IPv4 default route presence %d\n", ipv4 );
+            FreeMibTable( routes );
+        }
+        winetest_pop_context();
+    }
+
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&mgr );
+    ok( hr == S_OK, "failed to create manager, hr %#lx\n", hr );
+    if (FAILED(hr)) return;
+    connectivity = NLM_CONNECTIVITY_DISCONNECTED;
+    expected = NLM_CONNECTIVITY_IPV4_INTERNET |
+               (unavailable ? NLM_CONNECTIVITY_IPV6_INTERNET : NLM_CONNECTIVITY_IPV6_LOCALNETWORK);
+    hr = INetworkListManager_GetConnectivity( mgr, &connectivity );
+    ok( hr == S_OK, "GetConnectivity failed, hr %#lx\n", hr );
+    ok( connectivity == expected, "connectivity %#x, expected %#x\n", connectivity, expected );
+    INetworkListManager_Release( mgr );
+}
+
 START_TEST( list )
 {
-    char dynamic_dir[MAX_PATH] = {0}, reachability_dir[MAX_PATH] = {0};
+    char dynamic_dir[MAX_PATH] = {0}, reachability_dir[MAX_PATH] = {0}, ipv6_routes[32] = {0};
 
     GetEnvironmentVariableA( "WINETEST_NETPROFM_DYNAMIC_DIR", dynamic_dir, ARRAY_SIZE(dynamic_dir) );
     GetEnvironmentVariableA( "WINETEST_NETPROFM_REACHABILITY_DIR", reachability_dir,
                              ARRAY_SIZE(reachability_dir) );
+    GetEnvironmentVariableA( "WINETEST_NETPROFM_IPV6_ROUTES", ipv6_routes, ARRAY_SIZE(ipv6_routes) );
     CoInitialize( NULL );
     test_route_fallback();
     test_INetworkListManager();
     if (dynamic_dir[0]) test_dynamic_connectivity( dynamic_dir );
     if (reachability_dir[0]) test_reachability( reachability_dir );
+    if (ipv6_routes[0]) test_ipv6_route_availability( !strcmp( ipv6_routes, "unavailable" ) );
     CoUninitialize();
 }
