@@ -112,6 +112,7 @@ struct list_manager
     DWORD               reachability_worker_tid;
     UINT64              reachability_handle;
     enum reachability_state reachability;
+    BOOL                dynamic_topology;
     LONG                destroy_pending;
     DWORD               destroy_tid;
 };
@@ -2006,6 +2007,37 @@ static BOOL has_ipv4_default_route( const IP_ADAPTER_ADDRESSES *aa )
     return get_ipv4_default_route( aa ) == DEFAULT_ROUTE_PRESENT;
 }
 
+static void set_network_connectivity( struct network *network, const IP_ADAPTER_ADDRESSES *aa,
+                                      BOOL dynamic_topology )
+{
+    const IP_ADAPTER_GATEWAY_ADDRESS *gateway;
+    BOOL has_local, has_global, connected_v4 = FALSE, connected_v6 = FALSE;
+    BOOL internet_v4 = FALSE, internet_v6 = FALSE;
+
+    if (aa && (!dynamic_topology || aa->OperStatus == IfOperStatusUp))
+    {
+        has_ipv6_address( aa, &has_local, &has_global );
+        connected_v6 = has_local || has_global;
+        connected_v4 = has_ipv4_address( aa );
+        if (dynamic_topology)
+        {
+            internet_v6 = ipv6_has_internet( has_global, get_ipv6_default_route( aa ) );
+            internet_v4 = connected_v4 && has_ipv4_default_route( aa );
+        }
+        else
+        {
+            /* Preserve the snapshot policy on backends without link/route monitoring. */
+            internet_v6 = has_global;
+            for (gateway = aa->FirstGatewayAddress; gateway; gateway = gateway->Next)
+                if (gateway->Address.lpSockaddr->sa_family == AF_INET) internet_v4 = TRUE;
+        }
+    }
+    network->connected_v4 = connected_v4 ? VARIANT_TRUE : VARIANT_FALSE;
+    network->connected_v6 = connected_v6 ? VARIANT_TRUE : VARIANT_FALSE;
+    network->connected_to_internet_v4 = internet_v4 ? VARIANT_TRUE : VARIANT_FALSE;
+    network->connected_to_internet_v6 = internet_v6 ? VARIANT_TRUE : VARIANT_FALSE;
+}
+
 static NLM_CONNECTIVITY get_connectivity( struct list_manager *mgr )
 {
     NLM_CONNECTIVITY connectivity = NLM_CONNECTIVITY_DISCONNECTED;
@@ -2050,7 +2082,6 @@ static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
     struct connection *connection;
     NET_LUID luid;
     GUID id;
-    BOOL has_local, has_global, connected_v4, connected_v6, internet_v4, internet_v6;
     NLM_CONNECTIVITY old_connectivity, connectivity;
 
     if (!(buf = get_network_adapters())) return (NLM_CONNECTIVITY)-1;
@@ -2059,21 +2090,7 @@ static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
     old_connectivity = get_connectivity( mgr );
     LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
     {
-        connected_v4 = connected_v6 = internet_v4 = internet_v6 = FALSE;
-        if ((aa = find_adapter( buf, &network->id )) && aa->OperStatus == IfOperStatusUp)
-        {
-            has_ipv6_address( aa, &has_local, &has_global );
-            connected_v6 = has_local || has_global;
-            internet_v6 = ipv6_has_internet( has_global, get_ipv6_default_route( aa ) );
-            connected_v4 = has_ipv4_address( aa );
-            internet_v4 = connected_v4 && has_ipv4_default_route( aa );
-        }
-
-        network->connected_v4 = connected_v4 ? VARIANT_TRUE : VARIANT_FALSE;
-        network->connected_v6 = connected_v6 ? VARIANT_TRUE : VARIANT_FALSE;
-        network->connected_to_internet_v4 = internet_v4 ? VARIANT_TRUE : VARIANT_FALSE;
-        network->connected_to_internet_v6 = internet_v6 ? VARIANT_TRUE : VARIANT_FALSE;
-
+        set_network_connectivity( network, find_adapter( buf, &network->id ), mgr->dynamic_topology );
         LIST_FOR_EACH_ENTRY( connection, &mgr->connections, struct connection, entry )
         {
             if (!IsEqualGUID( &connection->id, &network->id )) continue;
@@ -2105,18 +2122,11 @@ static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
         network->mgr = &mgr->INetworkListManager_iface;
         connection->network = &network->INetwork_iface;
         connection->mgr = &mgr->INetworkListManager_iface;
-        if (aa->OperStatus == IfOperStatusUp)
-        {
-            has_ipv6_address( aa, &has_local, &has_global );
-            network->connected_v6 = connection->connected_v6 =
-                    has_local || has_global ? VARIANT_TRUE : VARIANT_FALSE;
-            network->connected_to_internet_v6 = connection->connected_to_internet_v6 =
-                    ipv6_has_internet( has_global, get_ipv6_default_route( aa ) ) ? VARIANT_TRUE : VARIANT_FALSE;
-            network->connected_v4 = connection->connected_v4 =
-                    has_ipv4_address( aa ) ? VARIANT_TRUE : VARIANT_FALSE;
-            network->connected_to_internet_v4 = connection->connected_to_internet_v4 =
-                    network->connected_v4 && has_ipv4_default_route( aa ) ? VARIANT_TRUE : VARIANT_FALSE;
-        }
+        set_network_connectivity( network, aa, mgr->dynamic_topology );
+        connection->connected_v4 = network->connected_v4;
+        connection->connected_v6 = network->connected_v6;
+        connection->connected_to_internet_v4 = network->connected_to_internet_v4;
+        connection->connected_to_internet_v6 = network->connected_to_internet_v6;
         list_add_tail( &mgr->networks, &network->entry );
         list_add_tail( &mgr->connections, &connection->entry );
     }
@@ -2355,7 +2365,6 @@ static void stop_monitor( struct list_manager *mgr )
 
 static void init_networks( struct list_manager *mgr )
 {
-    BOOL has_local, has_global;
     IP_ADAPTER_ADDRESSES *buf, *aa;
     GUID id;
 
@@ -2384,29 +2393,11 @@ static void init_networks( struct list_manager *mgr )
             goto done;
         }
 
-        if (aa->OperStatus != IfOperStatusUp) has_local = has_global = FALSE;
-        else has_ipv6_address( aa, &has_local, &has_global );
-        if (has_local || has_global)
-        {
-            network->connected_v6 = VARIANT_TRUE;
-            connection->connected_v6 = VARIANT_TRUE;
-        }
-        if (ipv6_has_internet( has_global, get_ipv6_default_route( aa ) ))
-        {
-            network->connected_to_internet_v6 = VARIANT_TRUE;
-            connection->connected_to_internet_v6 = VARIANT_TRUE;
-        }
-        if (aa->OperStatus == IfOperStatusUp && has_ipv4_address( aa ))
-        {
-            network->connected_v4 = VARIANT_TRUE;
-            connection->connected_v4 = VARIANT_TRUE;
-        }
-        if (aa->OperStatus == IfOperStatusUp && network->connected_v4 && has_ipv4_default_route( aa ))
-        {
-            network->connected_to_internet_v4 = VARIANT_TRUE;
-            connection->connected_to_internet_v4 = VARIANT_TRUE;
-        }
-
+        set_network_connectivity( network, aa, mgr->dynamic_topology );
+        connection->connected_v4 = network->connected_v4;
+        connection->connected_v6 = network->connected_v6;
+        connection->connected_to_internet_v4 = network->connected_to_internet_v4;
+        connection->connected_to_internet_v6 = network->connected_to_internet_v6;
         network->mgr = &mgr->INetworkListManager_iface;
         connection->network = &network->INetwork_iface;
         connection->mgr = &mgr->INetworkListManager_iface;
@@ -2433,6 +2424,7 @@ HRESULT list_manager_create( void **obj )
     mgr->refs = 1;
     InitializeCriticalSection( &mgr->cs );
     InitializeCriticalSection( &mgr->notify_cs );
+    mgr->dynamic_topology = !UNIX_CALL( topology_supported, NULL );
     init_networks( mgr );
 
     connection_point_init( &mgr->list_mgr_cp, &IID_INetworkListManagerEvents,

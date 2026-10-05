@@ -123,6 +123,14 @@ ip link set nlm1 down
 wait_marker carrier_down
 ip link set nlm1 up
 
+wait_marker add_adapter
+ip link add nlm2 type dummy
+ip addr add 203.0.113.2/24 dev nlm2
+ip -6 addr add 2001:db8:2::2/64 dev nlm2 nodad
+ip link set nlm2 up
+ip route add 198.51.100.0/24 via 203.0.113.1 dev nlm2 metric 100
+touch "$marker_dir/adapter_added"
+
 if ! wait "$test_pid"; then
     cat "$log"
     exit 1

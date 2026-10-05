@@ -685,8 +685,9 @@ static void test_dynamic_connectivity( const char *marker_dir )
     INetwork *network, *same_network;
     NLM_CONNECTIVITY initial, without_ipv4, without_ipv4_internet, without_ipv6_internet, current;
     LONG expected_callbacks = 0;
+    NET_LUID luid;
     GUID id;
-    DWORD cookie;
+    DWORD cookie, err, i;
     HRESULT hr;
 
     hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
@@ -853,6 +854,28 @@ static void test_dynamic_connectivity( const char *marker_dir )
         "recovery callback reported disconnected connectivity\n" );
     ok( sink.unadvise_hr == S_OK && !sink.cookie,
         "reentrant Unadvise failed, hr %#lx, cookie %lu\n", sink.unadvise_hr, sink.cookie );
+
+    /* A newly discovered adapter must use the same route policy as the
+     * initial snapshot and the existing networks refreshed above. */
+    write_marker( marker_dir, "add_adapter" );
+    ok( wait_for_marker( marker_dir, "adapter_added" ), "new adapter setup timed out\n" );
+    err = ConvertInterfaceAliasToLuid( L"nlm2", &luid );
+    ok( !err, "new adapter lookup failed, error %lu\n", err );
+    if (!err)
+    {
+        err = ConvertInterfaceLuidToGuid( &luid, &id );
+        ok( !err, "new adapter GUID lookup failed, error %lu\n", err );
+        same_network = NULL;
+        for (i = 0; i < 200; i++)
+        {
+            if (!same_network) INetworkListManager_GetNetwork( mgr, id, &same_network );
+            if (same_network && SUCCEEDED(INetwork_GetConnectivity( same_network, &current )) &&
+                current == (NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV6_LOCALNETWORK)) break;
+            pump_messages( 50 );
+        }
+        ok( i < 200, "new adapter did not acquire local-only connectivity, value %#x\n", current );
+        if (same_network) INetwork_Release( same_network );
+    }
 
     IConnectionPoint_Release( connection_point );
     INetwork_Release( network );
@@ -1114,19 +1137,110 @@ static void test_ipv6_route_availability( BOOL unavailable )
     INetworkListManager_Release( mgr );
 }
 
+static void test_topology_policy( const char *policy )
+{
+    const BOOL snapshot = !strncmp( policy, "snapshot", 8 ), down = !!strstr( policy, "down" );
+    IP_ADAPTER_ADDRESSES *addresses, *adapter;
+    IP_ADAPTER_UNICAST_ADDRESS *address;
+    MIB_IPFORWARD_TABLE2 *routes;
+    INetworkListManager *mgr;
+    IEnumNetworkConnections *connections;
+    INetworkConnection *connection;
+    INetwork *network;
+    NLM_CONNECTIVITY expected, connectivity;
+    BOOL found = FALSE, ipv4 = FALSE, ipv6 = FALSE;
+    ULONG size = 0, i;
+    DWORD err;
+    HRESULT hr;
+
+    trace( "topology policy %s\n", policy );
+    err = GetAdaptersAddresses( AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_DNS_SERVER,
+                                NULL, NULL, &size );
+    ok( err == ERROR_BUFFER_OVERFLOW, "adapter sizing returned %lu\n", err );
+    if (err != ERROR_BUFFER_OVERFLOW) return;
+    addresses = malloc( size );
+    err = GetAdaptersAddresses( AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_DNS_SERVER,
+                                NULL, addresses, &size );
+    ok( !err, "adapter enumeration returned %lu\n", err );
+    if (!err) for (adapter = addresses; adapter; adapter = adapter->Next)
+    {
+        if (wcscmp( adapter->FriendlyName, L"nlm0" )) continue;
+        found = TRUE;
+        ok( (adapter->OperStatus == IfOperStatusUp) == !down, "unexpected status %u\n", adapter->OperStatus );
+        ok( !!adapter->FirstGatewayAddress == !down, "unexpected gateway presence\n" );
+        for (address = adapter->FirstUnicastAddress; address; address = address->Next)
+        {
+            if (address->Address.lpSockaddr->sa_family == AF_INET) ipv4 = TRUE;
+            if (address->Address.lpSockaddr->sa_family == AF_INET6) ipv6 = TRUE;
+        }
+    }
+    ok( found && ipv4 && ipv6, "missing adapter or retained addresses: %d/%d/%d\n", found, ipv4, ipv6 );
+    free( addresses );
+    err = GetIpForwardTable2( AF_UNSPEC, &routes );
+    ok( !err, "route enumeration returned %lu\n", err );
+    if (!err)
+    {
+        for (i = 0; i < routes->NumEntries; i++)
+            ok( routes->Table[i].DestinationPrefix.PrefixLength, "unexpected default route\n" );
+        FreeMibTable( routes );
+    }
+
+    /* The namespace has global IPv6 but no IPv6 default. Its IPv4 gateway is
+     * only for a specific route and disappears when the adapter is down. */
+    if (snapshot) expected = NLM_CONNECTIVITY_IPV6_INTERNET |
+                             (down ? NLM_CONNECTIVITY_IPV4_LOCALNETWORK : NLM_CONNECTIVITY_IPV4_INTERNET);
+    else expected = down ? NLM_CONNECTIVITY_DISCONNECTED :
+                          NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&mgr );
+    ok( hr == S_OK, "failed to create manager, hr %#lx\n", hr );
+    if (FAILED(hr)) return;
+    hr = INetworkListManager_GetConnectivity( mgr, &connectivity );
+    ok( hr == S_OK && connectivity == expected, "manager connectivity %#x, expected %#x, hr %#lx\n",
+        connectivity, expected, hr );
+    hr = INetworkListManager_GetNetworkConnections( mgr, &connections );
+    ok( hr == S_OK, "GetNetworkConnections returned %#lx\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        hr = IEnumNetworkConnections_Next( connections, 1, &connection, NULL );
+        ok( hr == S_OK, "missing connection, hr %#lx\n", hr );
+        if (hr == S_OK)
+        {
+            hr = INetworkConnection_GetConnectivity( connection, &connectivity );
+            ok( hr == S_OK && connectivity == expected, "connection connectivity %#x, expected %#x\n",
+                connectivity, expected );
+            hr = INetworkConnection_GetNetwork( connection, &network );
+            ok( hr == S_OK, "GetNetwork returned %#lx\n", hr );
+            if (SUCCEEDED(hr))
+            {
+                hr = INetwork_GetConnectivity( network, &connectivity );
+                ok( hr == S_OK && connectivity == expected, "network connectivity %#x, expected %#x\n",
+                    connectivity, expected );
+                INetwork_Release( network );
+            }
+            INetworkConnection_Release( connection );
+        }
+        IEnumNetworkConnections_Release( connections );
+    }
+    INetworkListManager_Release( mgr );
+}
+
 START_TEST( list )
 {
     char dynamic_dir[MAX_PATH] = {0}, reachability_dir[MAX_PATH] = {0}, ipv6_routes[32] = {0};
+    char topology_policy[32] = {0};
 
     GetEnvironmentVariableA( "WINETEST_NETPROFM_DYNAMIC_DIR", dynamic_dir, ARRAY_SIZE(dynamic_dir) );
     GetEnvironmentVariableA( "WINETEST_NETPROFM_REACHABILITY_DIR", reachability_dir,
                              ARRAY_SIZE(reachability_dir) );
     GetEnvironmentVariableA( "WINETEST_NETPROFM_IPV6_ROUTES", ipv6_routes, ARRAY_SIZE(ipv6_routes) );
+    GetEnvironmentVariableA( "WINETEST_NETPROFM_TOPOLOGY_POLICY", topology_policy, ARRAY_SIZE(topology_policy) );
     CoInitialize( NULL );
     test_route_fallback();
     test_INetworkListManager();
     if (dynamic_dir[0]) test_dynamic_connectivity( dynamic_dir );
     if (reachability_dir[0]) test_reachability( reachability_dir );
     if (ipv6_routes[0]) test_ipv6_route_availability( !strcmp( ipv6_routes, "unavailable" ) );
+    if (topology_policy[0]) test_topology_policy( topology_policy );
     CoUninitialize();
 }

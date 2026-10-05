@@ -56,6 +56,7 @@ enum unix_funcs
     unix_reachability_start,
     unix_reachability_wait,
     unix_reachability_stop,
+    unix_topology_supported,
     unix_funcs_count,
 };
 

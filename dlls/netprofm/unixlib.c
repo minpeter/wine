@@ -349,11 +349,23 @@ static NTSTATUS reachability_stop( void *args )
 
 #endif /* SONAME_LIBDBUS_1 */
 
+/* Match the link/route notification backend, independently of D-Bus and of
+ * whether a particular manager succeeds in starting its monitor threads. */
+static NTSTATUS topology_supported( void *args )
+{
+#ifdef HAVE_LINUX_RTNETLINK_H
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     reachability_start,
     reachability_wait,
     reachability_stop,
+    topology_supported,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
@@ -426,6 +438,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     wow64_reachability_start,
     wow64_reachability_wait,
     wow64_reachability_stop,
+    topology_supported,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
