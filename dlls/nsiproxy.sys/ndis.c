@@ -349,18 +349,7 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
     fd = socket( PF_INET, SOCK_DGRAM, 0 );
     if (fd == -1) return;
 
-    if (!ioctl( fd, SIOCGIFFLAGS, &req ))
-    {
-        if (req.ifr_flags & IFF_UP) data->oper_status = IfOperStatusUp;
-#ifdef IFF_DORMANT
-        else if (req.ifr_flags & IFF_DORMANT) data->oper_status = IfOperStatusDormant;
-#endif
-        else data->oper_status = IfOperStatusDown;
-    } else data->oper_status = IfOperStatusUnknown;
-
-    data->flags.unk = 0;
-    data->flags.not_media_conn = 0;
-    data->flags.unk2 = 0;
+    data->media_conn_state = MediaConnectStateConnected;
 #ifdef __linux__
     {
         char filename[64];
@@ -375,9 +364,27 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
             fclose( fp );
         }
     }
-#else
-    data->media_conn_state = MediaConnectStateConnected;
 #endif
+
+    if (!ioctl( fd, SIOCGIFFLAGS, &req ))
+    {
+#ifdef __linux__
+        if (data->media_conn_state == MediaConnectStateUnknown && (req.ifr_flags & IFF_UP) &&
+            !(req.ifr_flags & IFF_RUNNING))
+            data->media_conn_state = MediaConnectStateDisconnected;
+#endif
+        if (!(req.ifr_flags & IFF_UP)) data->oper_status = IfOperStatusDown;
+#ifdef IFF_DORMANT
+        else if (req.ifr_flags & IFF_DORMANT) data->oper_status = IfOperStatusDormant;
+#endif
+        else if (data->media_conn_state == MediaConnectStateDisconnected)
+            data->oper_status = IfOperStatusLowerLayerDown;
+        else data->oper_status = IfOperStatusUp;
+    } else data->oper_status = IfOperStatusUnknown;
+
+    data->flags.unk = 0;
+    data->flags.not_media_conn = data->media_conn_state == MediaConnectStateDisconnected;
+    data->flags.unk2 = 0;
     data->unk = 0;
 
     if (!ioctl( fd, SIOCGIFMTU, &req )) data->mtu = req.ifr_mtu;

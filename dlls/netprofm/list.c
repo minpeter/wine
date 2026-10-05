@@ -1959,20 +1959,20 @@ static BOOL has_ipv4_address( const IP_ADAPTER_ADDRESSES *aa )
     return FALSE;
 }
 
-static BOOL has_ipv4_default_route( const IP_ADAPTER_ADDRESSES *aa )
+static enum default_route_state get_ipv4_default_route( const IP_ADAPTER_ADDRESSES *aa )
 {
     struct nsi_ipv4_forward_key *keys;
     DWORD count, err, i;
-    BOOL ret = FALSE;
+    enum default_route_state ret = DEFAULT_ROUTE_ABSENT;
 
     err = NsiAllocateAndGetTable( 1, &npi_ipv4_module, NSI_IP_FORWARD_TABLE,
                                   (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
-    if (err) return FALSE;
+    if (err) return DEFAULT_ROUTE_UNAVAILABLE;
     for (i = 0; i < count; i++)
     {
-        if (keys[i].luid.Value == aa->Luid.Value && !keys[i].prefix_len && keys[i].next_hop.s_addr)
+        if (keys[i].luid.Value == aa->Luid.Value && !keys[i].prefix_len)
         {
-            ret = TRUE;
+            ret = DEFAULT_ROUTE_PRESENT;
             break;
         }
     }
@@ -1980,28 +1980,30 @@ static BOOL has_ipv4_default_route( const IP_ADAPTER_ADDRESSES *aa )
     return ret;
 }
 
-static BOOL has_ipv6_default_route( const IP_ADAPTER_ADDRESSES *aa )
+static enum default_route_state get_ipv6_default_route( const IP_ADAPTER_ADDRESSES *aa )
 {
     struct nsi_ipv6_forward_key *keys;
     DWORD count, err, i;
-    BOOL ret = FALSE;
+    enum default_route_state ret = DEFAULT_ROUTE_ABSENT;
 
     err = NsiAllocateAndGetTable( 1, &npi_ipv6_module, NSI_IP_FORWARD_TABLE,
                                   (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
-    if (err) return FALSE;
+    if (err) return DEFAULT_ROUTE_UNAVAILABLE;
     for (i = 0; i < count; i++)
     {
-        static const IN6_ADDR zero;
-
-        if (keys[i].luid.Value == aa->Luid.Value && !keys[i].prefix_len &&
-            memcmp( &keys[i].next_hop, &zero, sizeof(zero) ))
+        if (keys[i].luid.Value == aa->Luid.Value && !keys[i].prefix_len)
         {
-            ret = TRUE;
+            ret = DEFAULT_ROUTE_PRESENT;
             break;
         }
     }
     NsiFreeTable( keys, NULL, NULL, NULL );
     return ret;
+}
+
+static BOOL has_ipv4_default_route( const IP_ADAPTER_ADDRESSES *aa )
+{
+    return get_ipv4_default_route( aa ) == DEFAULT_ROUTE_PRESENT;
 }
 
 static NLM_CONNECTIVITY get_connectivity( struct list_manager *mgr )
@@ -2062,7 +2064,7 @@ static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
         {
             has_ipv6_address( aa, &has_local, &has_global );
             connected_v6 = has_local || has_global;
-            internet_v6 = has_global && has_ipv6_default_route( aa );
+            internet_v6 = ipv6_has_internet( has_global, get_ipv6_default_route( aa ) );
             connected_v4 = has_ipv4_address( aa );
             internet_v4 = connected_v4 && has_ipv4_default_route( aa );
         }
@@ -2109,7 +2111,7 @@ static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
             network->connected_v6 = connection->connected_v6 =
                     has_local || has_global ? VARIANT_TRUE : VARIANT_FALSE;
             network->connected_to_internet_v6 = connection->connected_to_internet_v6 =
-                    has_global && has_ipv6_default_route( aa ) ? VARIANT_TRUE : VARIANT_FALSE;
+                    ipv6_has_internet( has_global, get_ipv6_default_route( aa ) ) ? VARIANT_TRUE : VARIANT_FALSE;
             network->connected_v4 = connection->connected_v4 =
                     has_ipv4_address( aa ) ? VARIANT_TRUE : VARIANT_FALSE;
             network->connected_to_internet_v4 = connection->connected_to_internet_v4 =
@@ -2389,7 +2391,7 @@ static void init_networks( struct list_manager *mgr )
             network->connected_v6 = VARIANT_TRUE;
             connection->connected_v6 = VARIANT_TRUE;
         }
-        if (has_global && has_ipv6_default_route( aa ))
+        if (ipv6_has_internet( has_global, get_ipv6_default_route( aa ) ))
         {
             network->connected_to_internet_v6 = VARIANT_TRUE;
             connection->connected_to_internet_v6 = VARIANT_TRUE;

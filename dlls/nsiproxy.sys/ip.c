@@ -1563,6 +1563,7 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void 
             entry.prefix.s_addr = strtoul( ptr, &ptr, 16 );
             entry.next_hop.s_addr = strtoul( ptr + 1, &ptr, 16 );
             rtf_flags = strtoul( ptr + 1, &ptr, 16 );
+            if (!(rtf_flags & RTF_UP) || (rtf_flags & RTF_REJECT)) continue;
             strtoul( ptr + 1, &ptr, 16 ); /* refcount, skip */
             strtoul( ptr + 1, &ptr, 16 ); /* use, skip */
             entry.metric = strtoul( ptr + 1, &ptr, 16 );
@@ -1823,7 +1824,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void 
             strtoul( ptr + 1, &ptr, 16 ); /* refcount, skip */
             strtoul( ptr + 1, &ptr, 16 ); /* use, skip */
             rtf_flags = strtoul( ptr + 1, &ptr, 16);
-            if (!(rtf_flags & RTF_UP)) continue;
+            if (!(rtf_flags & RTF_UP) || (rtf_flags & RTF_REJECT)) continue;
             entry.protocol = (rtf_flags & RTF_GATEWAY) ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
             entry.loopback = entry.prefix_len == 128 && IN6_IS_ADDR_LOOPBACK(&entry.prefix);
 
@@ -1849,7 +1850,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void 
 #else
     FIXME( "not implemented\n" );
     *count = 0;
-    return STATUS_SUCCESS;
+    return STATUS_NOT_IMPLEMENTED;
 #endif
 
     if (!want_data || num <= *count) *count = num;

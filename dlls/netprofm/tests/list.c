@@ -17,14 +17,20 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include "winsock2.h"
+#include "ws2ipdef.h"
 #include "windows.h"
 #define COBJMACROS
 #include "initguid.h"
+#include "iphlpapi.h"
+#include "iptypes.h"
 #include "objbase.h"
 #include "ocidl.h"
 #include "olectl.h"
 #include "netlistmgr.h"
 #include "wine/test.h"
+#include "../netprofm_private.h"
 
 struct dynamic_sink
 {
@@ -42,6 +48,18 @@ struct dynamic_sink
     BOOL teardown_on_callback;
     HRESULT unadvise_hr;
 };
+
+static void test_route_fallback( void )
+{
+    ok( !ipv6_has_internet( TRUE, DEFAULT_ROUTE_ABSENT ),
+        "global IPv6 address without a route reported Internet connectivity\n" );
+    ok( ipv6_has_internet( TRUE, DEFAULT_ROUTE_PRESENT ),
+        "global IPv6 address with a route did not report Internet connectivity\n" );
+    ok( ipv6_has_internet( TRUE, DEFAULT_ROUTE_UNAVAILABLE ),
+        "unavailable route enumeration did not preserve the IPv6 fallback\n" );
+    ok( !ipv6_has_internet( FALSE, DEFAULT_ROUTE_UNAVAILABLE ),
+        "unavailable route enumeration reported Internet without a global IPv6 address\n" );
+}
 
 static void test_INetwork( INetwork *network, INetworkConnection *conn )
 {
@@ -630,6 +648,29 @@ static BOOL wait_for_sink_refs( struct dynamic_sink *sink, LONG expected )
     return FALSE;
 }
 
+static IF_OPER_STATUS get_adapter_oper_status( const WCHAR *name )
+{
+    IP_ADAPTER_ADDRESSES *addresses, *address;
+    IF_OPER_STATUS status = IfOperStatusUnknown;
+    ULONG err, size = 0;
+
+    err = GetAdaptersAddresses( AF_UNSPEC, 0, NULL, NULL, &size );
+    if (err != ERROR_BUFFER_OVERFLOW) return status;
+    if (!(addresses = malloc( size ))) return status;
+    err = GetAdaptersAddresses( AF_UNSPEC, 0, NULL, addresses, &size );
+    if (!err)
+    {
+        for (address = addresses; address; address = address->Next)
+        {
+            if (wcscmp( address->FriendlyName, name )) continue;
+            status = address->OperStatus;
+            break;
+        }
+    }
+    free( addresses );
+    return status;
+}
+
 static void test_dynamic_connectivity( const char *marker_dir )
 {
     struct dynamic_sink sink;
@@ -639,6 +680,7 @@ static void test_dynamic_connectivity( const char *marker_dir )
     INetworkListManager *mgr;
     INetwork *network, *same_network;
     NLM_CONNECTIVITY initial, without_ipv4, without_ipv4_internet, without_ipv6_internet, current;
+    LONG expected_callbacks = 0;
     GUID id;
     DWORD cookie;
     HRESULT hr;
@@ -698,36 +740,98 @@ static void test_dynamic_connectivity( const char *marker_dir )
     without_ipv4_internet |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
     ok( wait_for_connectivity( mgr, without_ipv4_internet, TRUE, &current ),
         "IPv4 default route removal did not remove IPv4 Internet connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "IPv4 route-removal callback was not delivered, count %ld\n", sink.callback_count );
     write_marker( marker_dir, "route_removed" );
+
+    ok( wait_for_marker( marker_dir, "ipv4_unusable_route_added" ),
+        "timed out waiting for unusable IPv4 route\n" );
+    pump_messages( 500 );
+    hr = INetworkListManager_GetConnectivity( mgr, &current );
+    ok( hr == S_OK && current == without_ipv4_internet,
+        "unusable IPv4 route changed connectivity, hr %#lx, value %#x\n", hr, current );
+    ok( sink.callback_count == expected_callbacks,
+        "unusable IPv4 route produced a callback, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv4_unusable_route_checked" );
+
     ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
-        "route restoration did not restore connectivity, value %#x\n", current );
+        "on-link IPv4 default route did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "on-link IPv4 route callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "route_onlink_restored" );
+    ok( wait_for_connectivity( mgr, without_ipv4_internet, TRUE, &current ),
+        "on-link IPv4 default removal did not remove Internet connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "on-link IPv4 route-removal callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "route_onlink_removed" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "gateway IPv4 route restoration did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "gateway IPv4 route callback was not delivered, count %ld\n", sink.callback_count );
     write_marker( marker_dir, "route_restored" );
 
     without_ipv6_internet = initial & ~NLM_CONNECTIVITY_IPV6_INTERNET;
     without_ipv6_internet |= NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
     ok( wait_for_connectivity( mgr, without_ipv6_internet, TRUE, &current ),
         "IPv6 route removal did not remove IPv6 Internet connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "IPv6 route-removal callback was not delivered, count %ld\n", sink.callback_count );
     write_marker( marker_dir, "ipv6_route_removed" );
+
+    ok( wait_for_marker( marker_dir, "ipv6_unusable_route_added" ),
+        "timed out waiting for unusable IPv6 route\n" );
+    pump_messages( 500 );
+    hr = INetworkListManager_GetConnectivity( mgr, &current );
+    ok( hr == S_OK && current == without_ipv6_internet,
+        "unusable IPv6 route changed connectivity, hr %#lx, value %#x\n", hr, current );
+    ok( sink.callback_count == expected_callbacks,
+        "unusable IPv6 route produced a callback, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv6_unusable_route_checked" );
+
     ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
-        "IPv6 route restoration did not restore connectivity, value %#x\n", current );
+        "on-link IPv6 default route did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "on-link IPv6 route callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv6_route_onlink_restored" );
+    ok( wait_for_connectivity( mgr, without_ipv6_internet, TRUE, &current ),
+        "on-link IPv6 default removal did not remove Internet connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "on-link IPv6 route-removal callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv6_route_onlink_removed" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "gateway IPv6 route restoration did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "gateway IPv6 route callback was not delivered, count %ld\n", sink.callback_count );
     write_marker( marker_dir, "ipv6_route_restored" );
 
     without_ipv4 = initial & ~(NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV4_INTERNET);
     ok( wait_for_connectivity( mgr, without_ipv4, TRUE, &current ),
         "address removal did not remove IPv4 connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "address-removal callback was not delivered, count %ld\n", sink.callback_count );
     write_marker( marker_dir, "address_removed" );
     ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
         "address restoration did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "address-restoration callback was not delivered, count %ld\n", sink.callback_count );
     write_marker( marker_dir, "address_restored" );
 
     ok( wait_for_connectivity( mgr, NLM_CONNECTIVITY_DISCONNECTED, TRUE, &current ),
-        "link down did not disconnect, value %#x\n", current );
-    ok( wait_for_callback_count( &sink, 7 ), "link-down callback was not delivered, count %ld\n",
-        sink.callback_count );
+        "carrier loss did not disconnect, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "carrier-loss callback was not delivered, count %ld\n", sink.callback_count );
+    ok( sink.callback_connectivity == NLM_CONNECTIVITY_DISCONNECTED,
+        "carrier-loss callback reported %#x\n", sink.callback_connectivity );
+    ok( get_adapter_oper_status( L"nlm0" ) == IfOperStatusLowerLayerDown,
+        "carrier loss did not report lower-layer-down operational status\n" );
     sink.unadvise_on_callback = TRUE;
-    write_marker( marker_dir, "down" );
+    write_marker( marker_dir, "carrier_down" );
     ok( wait_for_connectivity( mgr, initial, TRUE, &current ), "connectivity did not recover, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "carrier-restoration callback was not delivered, count %ld\n", sink.callback_count );
     ok( current == initial, "connectivity changed from %#x to %#x\n", initial, current );
+    ok( get_adapter_oper_status( L"nlm0" ) == IfOperStatusUp,
+        "carrier restoration did not report operational status up\n" );
 
     same_network = NULL;
     hr = INetworkListManager_GetNetwork( mgr, id, &same_network );
@@ -735,7 +839,8 @@ static void test_dynamic_connectivity( const char *marker_dir )
     ok( same_network == network, "network identity changed, %p != %p\n", same_network, network );
     if (same_network) INetwork_Release( same_network );
 
-    ok( sink.callback_count == 8, "expected eight callbacks, got %ld\n", sink.callback_count );
+    ok( sink.callback_count == expected_callbacks, "expected %ld callbacks, got %ld\n",
+        expected_callbacks, sink.callback_count );
     ok( !sink.callback_mismatch, "callback reentrant GetConnectivity mismatched %ld times\n",
         sink.callback_mismatch );
     ok( !sink.callback_thread_mismatch, "callback ran outside the advising STA %ld times\n",
@@ -900,6 +1005,7 @@ START_TEST( list )
     GetEnvironmentVariableA( "WINETEST_NETPROFM_REACHABILITY_DIR", reachability_dir,
                              ARRAY_SIZE(reachability_dir) );
     CoInitialize( NULL );
+    test_route_fallback();
     test_INetworkListManager();
     if (dynamic_dir[0]) test_dynamic_connectivity( dynamic_dir );
     if (reachability_dir[0]) test_reachability( reachability_dir );

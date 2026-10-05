@@ -16,4 +16,16 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-HRESULT list_manager_create(void **);
+enum default_route_state
+{
+    DEFAULT_ROUTE_UNAVAILABLE,
+    DEFAULT_ROUTE_ABSENT,
+    DEFAULT_ROUTE_PRESENT,
+};
+
+static inline BOOL ipv6_has_internet( BOOL has_global, enum default_route_state route )
+{
+    return has_global && route != DEFAULT_ROUTE_ABSENT;
+}
+
+HRESULT list_manager_create( void ** );

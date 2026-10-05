@@ -43,9 +43,10 @@ if [ -n "$run_uid" ]; then
 fi
 
 ip link set lo up
-ip link add nlm0 type dummy
+ip link add nlm0 type veth peer name nlm1
 ip addr add 192.0.2.2/24 dev nlm0
 ip -6 addr add 2001:db8::2/64 dev nlm0 nodad
+ip link set nlm1 up
 ip link set nlm0 up
 ip route add default via 192.0.2.1 dev nlm0
 
@@ -86,10 +87,26 @@ wait_marker ready
 ip route add 198.51.100.0/24 via 192.0.2.1 dev nlm0
 ip route del default
 wait_marker route_removed
+ip route add blackhole default
+touch "$marker_dir/ipv4_unusable_route_added"
+wait_marker ipv4_unusable_route_checked
+ip route del blackhole default
+ip route add default dev nlm0
+wait_marker route_onlink_restored
+ip route del default dev nlm0
+wait_marker route_onlink_removed
 ip route add default via 192.0.2.1 dev nlm0
 wait_marker route_restored
 ip -6 route del default
 wait_marker ipv6_route_removed
+ip -6 route add blackhole default
+touch "$marker_dir/ipv6_unusable_route_added"
+wait_marker ipv6_unusable_route_checked
+ip -6 route del blackhole default
+ip -6 route add default dev nlm0
+wait_marker ipv6_route_onlink_restored
+ip -6 route del default dev nlm0
+wait_marker ipv6_route_onlink_removed
 ip -6 route add default via 2001:db8::1 dev nlm0 onlink
 wait_marker ipv6_route_restored
 ip addr del 192.0.2.2/24 dev nlm0
@@ -97,13 +114,9 @@ wait_marker address_removed
 ip addr add 192.0.2.2/24 dev nlm0
 ip route add default via 192.0.2.1 dev nlm0
 wait_marker address_restored
-ip link set nlm0 down
-wait_marker down
-ip link set nlm0 up
-sleep 0.5
-ip -6 addr add 2001:db8::2/64 dev nlm0 nodad
-ip route replace default via 192.0.2.1 dev nlm0
-ip -6 route replace default via 2001:db8::1 dev nlm0 onlink
+ip link set nlm1 down
+wait_marker carrier_down
+ip link set nlm1 up
 
 if ! wait "$test_pid"; then
     cat "$log"
