@@ -44,6 +44,13 @@ struct reachability_stop_params
     UINT64 handle;
 };
 
+C_ASSERT( sizeof(struct reachability_start_params) == 16 );
+C_ASSERT( FIELD_OFFSET(struct reachability_start_params, state) == 8 );
+C_ASSERT( sizeof(struct reachability_wait_params) == 16 );
+C_ASSERT( FIELD_OFFSET(struct reachability_wait_params, state) == 8 );
+C_ASSERT( FIELD_OFFSET(struct reachability_wait_params, changed) == 12 );
+C_ASSERT( sizeof(struct reachability_stop_params) == 8 );
+
 enum unix_funcs
 {
     unix_reachability_start,

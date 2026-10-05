@@ -3,40 +3,58 @@ set -eu
 
 if [ "${1-}" != "--inside" ]; then
     build_dir=${1:?usage: $0 BUILD_DIR}
+    build_dir=$(CDPATH= cd -- "$build_dir" && pwd)
+    test_dir=$build_dir/dlls/netprofm/tests
+    test_exes=
+
+    if [ -f "$test_dir/x86_64-windows/netprofm_test.exe" ] &&
+       [ -f "$test_dir/i386-windows/netprofm_test.exe" ]; then
+        test_exes="$test_dir/x86_64-windows/netprofm_test.exe $test_dir/i386-windows/netprofm_test.exe"
+    else
+        for candidate in "$test_dir/netprofm_test.exe.so" "$test_dir/netprofm_test.exe" \
+                "$test_dir/x86_64-windows/netprofm_test.exe" "$test_dir"/*-windows/netprofm_test.exe
+        do
+            if [ -f "$candidate" ]; then
+                test_exes=$candidate
+                break
+            fi
+        done
+    fi
+    if [ -z "$test_exes" ]; then
+        echo "could not find the netprofm test executable under $test_dir" >&2
+        exit 1
+    fi
+
     if unshare --user --map-root-user --net true 2>/dev/null; then
-        exec unshare --user --map-root-user --net "$0" --inside "$build_dir"
+        for test_exe in $test_exes; do
+            label=$(basename "$(dirname "$test_exe")")
+            unshare --user --map-root-user --net "$0" --inside "$build_dir" "$test_exe" "$label"
+        done
+        exit
     fi
     if command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
-        exec sudo unshare --net "$0" --inside "$build_dir" "$(id -u)" "$(id -g)"
+        for test_exe in $test_exes; do
+            label=$(basename "$(dirname "$test_exe")")
+            sudo unshare --net "$0" --inside "$build_dir" "$test_exe" "$label" "$(id -u)" "$(id -g)"
+        done
+        exit
     fi
     echo "unprivileged user/network namespaces are unavailable" >&2
     exit 1
 fi
 
 build_dir=$2
-run_uid=${3-}
-run_gid=${4-}
+test_exe=$3
+label=$4
+run_uid=${5-}
+run_gid=${6-}
 source_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-marker_dir=/tmp/wine-netprofm-reachability
-prefix=/tmp/wine-netprofm-reachability-prefix
-log=/tmp/wine-netprofm-reachability.log
-bus_info=/tmp/wine-netprofm-reachability-bus
-bus_socket=/tmp/wine-netprofm-reachability-bus.sock
-test_dir=$build_dir/dlls/netprofm/tests
-test_exe=
-
-for candidate in "$test_dir/netprofm_test.exe.so" "$test_dir/netprofm_test.exe" \
-        "$test_dir/x86_64-windows/netprofm_test.exe" "$test_dir"/*-windows/netprofm_test.exe
-do
-    if [ -f "$candidate" ]; then
-        test_exe=$candidate
-        break
-    fi
-done
-if [ -z "$test_exe" ]; then
-    echo "could not find the netprofm test executable under $test_dir" >&2
-    exit 1
-fi
+marker_dir=/tmp/wine-netprofm-reachability-$label
+prefix=/tmp/wine-netprofm-reachability-prefix-$label
+log=/tmp/wine-netprofm-reachability-$label.log
+bus_info=/tmp/wine-netprofm-reachability-bus-$label
+bus_socket=/tmp/wine-netprofm-reachability-bus-$label.sock
+marker_win=Z:\\tmp\\wine-netprofm-reachability-$label
 
 rm -rf "$marker_dir" "$prefix" "$log" "$bus_info" "$bus_socket"
 mkdir -p "$marker_dir" "$prefix"
@@ -138,11 +156,11 @@ if [ -n "$run_uid" ]; then
     run_home=$(getent passwd "$run_uid" | cut -d: -f6)
     setpriv --reuid="$run_uid" --regid="$run_gid" --init-groups env HOME="$run_home" \
         DBUS_SYSTEM_BUS_ADDRESS="$bus_address" \
-        WINETEST_NETPROFM_REACHABILITY_DIR='Z:\tmp\wine-netprofm-reachability' WINEPREFIX="$prefix" \
+        WINETEST_NETPROFM_REACHABILITY_DIR="$marker_win" WINEPREFIX="$prefix" \
         "$build_dir/wine" "$test_exe" list >"$log" 2>&1 &
 else
     env DBUS_SYSTEM_BUS_ADDRESS="$bus_address" \
-        WINETEST_NETPROFM_REACHABILITY_DIR='Z:\tmp\wine-netprofm-reachability' WINEPREFIX="$prefix" \
+        WINETEST_NETPROFM_REACHABILITY_DIR="$marker_win" WINEPREFIX="$prefix" \
         "$build_dir/wine" "$test_exe" list >"$log" 2>&1 &
 fi
 test_pid=$!

@@ -354,3 +354,77 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+
+#ifdef _WIN64
+
+struct reachability_start_params32
+{
+    UINT64 handle;
+    UINT32 state;
+};
+
+struct reachability_wait_params32
+{
+    UINT64 handle;
+    UINT32 state;
+    UINT32 changed;
+};
+
+struct reachability_stop_params32
+{
+    UINT64 handle;
+};
+
+C_ASSERT( sizeof(struct reachability_start_params32) == 16 );
+C_ASSERT( offsetof(struct reachability_start_params32, state) == 8 );
+C_ASSERT( sizeof(struct reachability_wait_params32) == 16 );
+C_ASSERT( offsetof(struct reachability_wait_params32, state) == 8 );
+C_ASSERT( offsetof(struct reachability_wait_params32, changed) == 12 );
+C_ASSERT( sizeof(struct reachability_stop_params32) == 8 );
+
+static NTSTATUS wow64_reachability_start( void *args )
+{
+    struct reachability_start_params32 *params32 = args;
+    struct reachability_start_params params = {0};
+    NTSTATUS status;
+
+    if (!(status = reachability_start( &params )))
+    {
+        params32->handle = params.handle;
+        params32->state = params.state;
+    }
+    return status;
+}
+
+static NTSTATUS wow64_reachability_wait( void *args )
+{
+    struct reachability_wait_params32 *params32 = args;
+    struct reachability_wait_params params = {params32->handle};
+    NTSTATUS status;
+
+    if (!(status = reachability_wait( &params )))
+    {
+        params32->state = params.state;
+        params32->changed = params.changed;
+    }
+    return status;
+}
+
+static NTSTATUS wow64_reachability_stop( void *args )
+{
+    const struct reachability_stop_params32 *params32 = args;
+    struct reachability_stop_params params = {params32->handle};
+
+    return reachability_stop( &params );
+}
+
+const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+{
+    wow64_reachability_start,
+    wow64_reachability_wait,
+    wow64_reachability_stop,
+};
+
+C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
+
+#endif /* _WIN64 */
