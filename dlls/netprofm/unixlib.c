@@ -58,6 +58,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(netprofm);
     DO_FUNC(dbus_error_init);                           \
     DO_FUNC(dbus_message_get_args);                     \
     DO_FUNC(dbus_message_get_path);                     \
+    DO_FUNC(dbus_message_get_sender);                   \
+    DO_FUNC(dbus_message_has_signature);                \
     DO_FUNC(dbus_message_is_signal);                    \
     DO_FUNC(dbus_message_iter_append_basic);            \
     DO_FUNC(dbus_message_iter_get_arg_type);            \
@@ -78,6 +80,7 @@ DBUS_FUNCS;
 struct reachability_context
 {
     DBusConnection *connection;
+    char *owner;
     enum reachability_state state;
     BOOL refresh;
     unsigned int retry_count;
@@ -116,20 +119,56 @@ static const char *next_dict_entry( DBusMessageIter *iter, DBusMessageIter *vari
 
     if (p_dbus_message_iter_get_arg_type( iter ) != DBUS_TYPE_DICT_ENTRY) return NULL;
     p_dbus_message_iter_recurse( iter, &entry );
-    p_dbus_message_iter_next( iter );
+    if (p_dbus_message_iter_get_arg_type( &entry ) != DBUS_TYPE_STRING) return NULL;
     p_dbus_message_iter_get_basic( &entry, &name );
-    p_dbus_message_iter_next( &entry );
+    if (!name || !p_dbus_message_iter_next( &entry ) ||
+        p_dbus_message_iter_get_arg_type( &entry ) != DBUS_TYPE_VARIANT) return NULL;
     p_dbus_message_iter_recurse( &entry, variant );
+    if (p_dbus_message_iter_get_arg_type( variant ) == DBUS_TYPE_INVALID ||
+        p_dbus_message_iter_next( &entry )) return NULL;
+    p_dbus_message_iter_next( iter );
     return name;
+}
+
+static BOOL read_owner( struct reachability_context *context )
+{
+    const char *name = "org.freedesktop.NetworkManager", *owner;
+    DBusMessage *request, *reply;
+    DBusMessageIter iter;
+    DBusError error;
+
+    free( context->owner );
+    context->owner = NULL;
+    request = p_dbus_message_new_method_call( "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                             "org.freedesktop.DBus", "GetNameOwner" );
+    if (!request) return FALSE;
+    p_dbus_message_iter_init_append( request, &iter );
+    if (!p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &name ))
+    {
+        p_dbus_message_unref( request );
+        return FALSE;
+    }
+    p_dbus_error_init( &error );
+    reply = p_dbus_connection_send_with_reply_and_block( context->connection, request, 1000, &error );
+    p_dbus_message_unref( request );
+    if (reply)
+    {
+        if (p_dbus_message_has_signature( reply, "s" ) &&
+            p_dbus_message_get_args( reply, &error, DBUS_TYPE_STRING, &owner, DBUS_TYPE_INVALID ) &&
+            owner[0] == ':')
+            context->owner = strdup( owner );
+        p_dbus_message_unref( reply );
+    }
+    p_dbus_error_free( &error );
+    return !!context->owner;
 }
 
 static enum reachability_state read_reachability( struct reachability_context *context )
 {
-    static const char service[] = "org.freedesktop.NetworkManager";
     static const char path[] = "/org/freedesktop/NetworkManager";
     static const char properties[] = "org.freedesktop.DBus.Properties";
     static const char interface[] = "org.freedesktop.NetworkManager";
-    DBusMessageIter iter, variant;
+    DBusMessageIter iter, array, variant;
     DBusMessage *request, *reply;
     dbus_uint32_t connectivity = 0;
     dbus_bool_t available = FALSE, enabled = FALSE;
@@ -137,13 +176,21 @@ static enum reachability_state read_reachability( struct reachability_context *c
     DBusError error;
     const char *name;
 
-    request = p_dbus_message_new_method_call( service, path, properties, "GetAll" );
+    /* Resolve outside the filter. A queued owner change can predate this
+     * snapshot, so never install an owner from a signal's historical body. */
+    context->refresh = FALSE;
+    if (!read_owner( context )) return REACHABILITY_INDETERMINATE;
+    request = p_dbus_message_new_method_call( context->owner, path, properties, "GetAll" );
     if (!request) return REACHABILITY_INDETERMINATE;
     /* The provider observes an existing service; it must never activate one. */
     p_dbus_message_set_auto_start( request, FALSE );
     p_dbus_message_iter_init_append( request, &iter );
     name = interface;
-    p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &name );
+    if (!p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &name ))
+    {
+        p_dbus_message_unref( request );
+        return REACHABILITY_INDETERMINATE;
+    }
 
     p_dbus_error_init( &error );
     reply = p_dbus_connection_send_with_reply_and_block( context->connection, request, 1000, &error );
@@ -155,27 +202,32 @@ static enum reachability_state read_reachability( struct reachability_context *c
     }
     p_dbus_error_free( &error );
 
-    if (p_dbus_message_iter_init( reply, &iter ) &&
+    if (p_dbus_message_has_signature( reply, "a{sv}" ) &&
+        p_dbus_message_iter_init( reply, &iter ) &&
         p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_ARRAY)
     {
-        p_dbus_message_iter_recurse( &iter, &iter );
-        while ((name = next_dict_entry( &iter, &variant )))
+        p_dbus_message_iter_recurse( &iter, &array );
+        while (p_dbus_message_iter_get_arg_type( &array ) != DBUS_TYPE_INVALID)
         {
-            if (!strcmp( name, "Connectivity" ) &&
-                p_dbus_message_iter_get_arg_type( &variant ) == DBUS_TYPE_UINT32)
+            if (!(name = next_dict_entry( &array, &variant ))) goto malformed;
+            if (!strcmp( name, "Connectivity" ))
             {
+                if (have_connectivity || p_dbus_message_iter_get_arg_type( &variant ) != DBUS_TYPE_UINT32)
+                    goto malformed;
                 p_dbus_message_iter_get_basic( &variant, &connectivity );
                 have_connectivity = TRUE;
             }
-            else if (!strcmp( name, "ConnectivityCheckAvailable" ) &&
-                     p_dbus_message_iter_get_arg_type( &variant ) == DBUS_TYPE_BOOLEAN)
+            else if (!strcmp( name, "ConnectivityCheckAvailable" ))
             {
+                if (have_available || p_dbus_message_iter_get_arg_type( &variant ) != DBUS_TYPE_BOOLEAN)
+                    goto malformed;
                 p_dbus_message_iter_get_basic( &variant, &available );
                 have_available = TRUE;
             }
-            else if (!strcmp( name, "ConnectivityCheckEnabled" ) &&
-                     p_dbus_message_iter_get_arg_type( &variant ) == DBUS_TYPE_BOOLEAN)
+            else if (!strcmp( name, "ConnectivityCheckEnabled" ))
             {
+                if (have_enabled || p_dbus_message_iter_get_arg_type( &variant ) != DBUS_TYPE_BOOLEAN)
+                    goto malformed;
                 p_dbus_message_iter_get_basic( &variant, &enabled );
                 have_enabled = TRUE;
             }
@@ -188,28 +240,47 @@ static enum reachability_state read_reachability( struct reachability_context *c
     if (connectivity == 4) return REACHABILITY_ONLINE;
     if (connectivity <= 3) return REACHABILITY_OFFLINE;
     return REACHABILITY_INDETERMINATE;
+
+malformed:
+    p_dbus_message_unref( reply );
+    return REACHABILITY_INDETERMINATE;
 }
 
 static DBusHandlerResult reachability_filter( DBusConnection *connection, DBusMessage *message, void *data )
 {
     struct reachability_context *context = data;
     const char *name, *old_owner, *new_owner;
+    const char *sender = p_dbus_message_get_sender( message );
+    const char *path = p_dbus_message_get_path( message );
+    DBusMessageIter iter;
     DBusError error;
 
     if (p_dbus_message_is_signal( message, "org.freedesktop.DBus.Properties", "PropertiesChanged" ) &&
-        p_dbus_message_get_path( message ) &&
-        !strcmp( p_dbus_message_get_path( message ), "/org/freedesktop/NetworkManager" ))
+        p_dbus_message_has_signature( message, "sa{sv}as" ) &&
+        path && !strcmp( path, "/org/freedesktop/NetworkManager" ) &&
+        sender && context->owner && !strcmp( sender, context->owner ) &&
+        p_dbus_message_iter_init( message, &iter ) &&
+        p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_STRING)
     {
-        context->refresh = TRUE;
+        p_dbus_message_iter_get_basic( &iter, &name );
+        if (name && !strcmp( name, "org.freedesktop.NetworkManager" )) context->refresh = TRUE;
     }
-    else if (p_dbus_message_is_signal( message, "org.freedesktop.DBus", "NameOwnerChanged" ))
+    else if (p_dbus_message_is_signal( message, "org.freedesktop.DBus", "NameOwnerChanged" ) &&
+             p_dbus_message_has_signature( message, "sss" ) &&
+             path && !strcmp( path, "/org/freedesktop/DBus" ) &&
+             sender && !strcmp( sender, "org.freedesktop.DBus" ))
     {
         p_dbus_error_init( &error );
         if (p_dbus_message_get_args( message, &error, DBUS_TYPE_STRING, &name,
                                      DBUS_TYPE_STRING, &old_owner, DBUS_TYPE_STRING, &new_owner,
                                      DBUS_TYPE_INVALID ) &&
-            !strcmp( name, "org.freedesktop.NetworkManager" ))
+            !strcmp( name, "org.freedesktop.NetworkManager" ) &&
+            (!old_owner[0] || old_owner[0] == ':') && (!new_owner[0] || new_owner[0] == ':'))
+        {
+            free( context->owner );
+            context->owner = NULL;
             context->refresh = TRUE;
+        }
         p_dbus_error_free( &error );
     }
     return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
@@ -217,6 +288,8 @@ static DBusHandlerResult reachability_filter( DBusConnection *connection, DBusMe
 
 static void disconnect_reachability( struct reachability_context *context )
 {
+    free( context->owner );
+    context->owner = NULL;
     if (!context->connection) return;
     p_dbus_connection_close( context->connection );
     p_dbus_connection_unref( context->connection );
@@ -242,9 +315,11 @@ static BOOL add_match( DBusConnection *connection, const char *match )
 static BOOL connect_reachability( struct reachability_context *context )
 {
     static const char properties_match[] = "type='signal',interface='org.freedesktop.DBus.Properties',"
-                                           "member='PropertiesChanged',path='/org/freedesktop/NetworkManager'";
+                                           "member='PropertiesChanged',path='/org/freedesktop/NetworkManager',"
+                                           "sender='org.freedesktop.NetworkManager',arg0='org.freedesktop.NetworkManager'";
     static const char owner_match[] = "type='signal',interface='org.freedesktop.DBus',"
-                                      "member='NameOwnerChanged',arg0='org.freedesktop.NetworkManager'";
+                                      "member='NameOwnerChanged',arg0='org.freedesktop.NetworkManager',"
+                                      "sender='org.freedesktop.DBus',path='/org/freedesktop/DBus'";
     DBusError error;
 
     p_dbus_error_init( &error );
@@ -272,7 +347,7 @@ static NTSTATUS reachability_start( void *args )
     struct reachability_context *context;
 
     if (!load_dbus_functions()) return STATUS_NOT_SUPPORTED;
-    p_dbus_threads_init_default();
+    if (!p_dbus_threads_init_default()) return STATUS_NO_MEMORY;
     if (!(context = calloc( 1, sizeof(*context) ))) return STATUS_NO_MEMORY;
 
     context->state = connect_reachability( context ) ? read_reachability( context )
@@ -289,7 +364,6 @@ static NTSTATUS reachability_wait( void *args )
     enum reachability_state state;
     BOOL retry = FALSE;
 
-    context->refresh = FALSE;
     if (!context->connection)
     {
         poll( NULL, 0, 250 );
