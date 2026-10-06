@@ -80,6 +80,8 @@ cleanup()
         kill "$(cat "$marker_dir/activated")" 2>/dev/null || true
     fi
     [ -z "$bus_pid" ] || kill "$bus_pid" 2>/dev/null || true
+    run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -k 2>/dev/null || true
+    run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -98,6 +100,12 @@ run_as_user()
 run_as_user env WINEPREFIX="$prefix" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$marker_dir/no-bus" \
     "$build_dir/wine" wineboot --init >"$log" 2>&1
 run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w
+# Keep the device host alive with no bus: unrelated mountmgr/BlueZ connections
+# otherwise exit on the test bus's disconnect and take NSI down with them.
+# Start it after prefix installation, so newly registered drivers are loaded.
+run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -p
+run_as_user env WINEPREFIX="$prefix" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$marker_dir/no-bus" \
+    "$build_dir/wine" cmd /c exit >>"$log" 2>&1
 
 bus_address="unix:path=$bus_socket"
 # Install an activatable but initially stopped service on a private bus. The
