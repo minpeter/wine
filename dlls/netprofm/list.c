@@ -105,6 +105,7 @@ struct list_manager
     CRITICAL_SECTION    notify_cs;
     HANDLE              stop_event;
     HANDLE              monitor_ready_event;
+    HRESULT             monitor_result;
     HANDLE              worker;
     DWORD               worker_tid;
     HANDLE              reachability_stop_event;
@@ -2075,7 +2076,7 @@ static IP_ADAPTER_ADDRESSES *find_adapter( IP_ADAPTER_ADDRESSES *buf, const GUID
     return NULL;
 }
 
-static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
+static HRESULT refresh_networks( struct list_manager *mgr, NLM_CONNECTIVITY *changed )
 {
     IP_ADAPTER_ADDRESSES *buf, *aa;
     struct network *network;
@@ -2084,7 +2085,8 @@ static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
     GUID id;
     NLM_CONNECTIVITY old_connectivity, connectivity;
 
-    if (!(buf = get_network_adapters())) return (NLM_CONNECTIVITY)-1;
+    *changed = (NLM_CONNECTIVITY)-1;
+    if (!(buf = get_network_adapters())) return E_OUTOFMEMORY;
 
     EnterCriticalSection( &mgr->cs );
     old_connectivity = get_connectivity( mgr );
@@ -2134,7 +2136,8 @@ static NLM_CONNECTIVITY refresh_networks( struct list_manager *mgr )
     LeaveCriticalSection( &mgr->cs );
     free( buf );
 
-    return connectivity == old_connectivity ? (NLM_CONNECTIVITY)-1 : connectivity;
+    if (connectivity != old_connectivity) *changed = connectivity;
+    return S_OK;
 }
 
 static void notify_connectivity_changed( struct list_manager *mgr, NLM_CONNECTIVITY connectivity )
@@ -2193,14 +2196,16 @@ static DWORD WINAPI reachability_monitor_proc( void *param )
     struct list_manager *mgr = param;
     struct reachability_wait_params params = {mgr->reachability_handle};
     NTSTATUS status;
+    DWORD ret;
 
     CoInitializeEx( NULL, COINIT_MULTITHREADED );
-    while (WaitForSingleObject( mgr->reachability_stop_event, 0 ) != WAIT_OBJECT_0)
+    while ((ret = WaitForSingleObject( mgr->reachability_stop_event, 0 )) == WAIT_TIMEOUT)
     {
         status = UNIX_CALL( reachability_wait, &params );
-        if (params.changed) update_reachability( mgr, params.state );
         if (status) break;
+        if (params.changed) update_reachability( mgr, params.state );
     }
+    if (ret != WAIT_OBJECT_0) update_reachability( mgr, REACHABILITY_INDETERMINATE );
     if (InterlockedCompareExchange( &mgr->destroy_pending, 0, 0 ) && mgr->destroy_tid == GetCurrentThreadId())
         list_manager_destroy( mgr );
     CoUninitialize();
@@ -2254,16 +2259,48 @@ struct monitor_subscription
     BOOL pending;
 };
 
-static void arm_subscription( struct monitor_subscription *subscription )
+static DWORD arm_subscription( struct monitor_subscription *subscription )
 {
     DWORD err;
 
-    ResetEvent( subscription->overlapped.hEvent );
+    if (!ResetEvent( subscription->overlapped.hEvent )) return GetLastError();
     err = NsiRequestChangeNotification( 0, subscription->module, subscription->table,
                                         &subscription->overlapped, &subscription->handle );
     subscription->pending = err == ERROR_IO_PENDING;
     if (err && err != ERROR_IO_PENDING)
         WARN( "failed to subscribe to NSI table %u, error %lu\n", subscription->table, err );
+    /* A synchronous completion is a change, not an outstanding subscription. */
+    if (!err && !SetEvent( subscription->overlapped.hEvent )) return GetLastError();
+    return err == ERROR_IO_PENDING ? ERROR_SUCCESS : err;
+}
+
+static void downgrade_monitor( struct list_manager *mgr )
+{
+    struct network *network;
+    struct connection *connection;
+    NLM_CONNECTIVITY old_connectivity, connectivity;
+
+    WARN( "network monitor failed, switching to snapshot policy\n" );
+    EnterCriticalSection( &mgr->notify_cs );
+    EnterCriticalSection( &mgr->cs );
+    old_connectivity = get_connectivity( mgr );
+    mgr->dynamic_topology = FALSE;
+    if (FAILED(refresh_networks( mgr, &connectivity )))
+    {
+        /* No snapshot is available. Do not retain an unmonitored Internet
+         * classification indefinitely after a fatal monitor failure. */
+        LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
+            set_network_connectivity( network, NULL, FALSE );
+        LIST_FOR_EACH_ENTRY( connection, &mgr->connections, struct connection, entry )
+        {
+            connection->connected_v4 = connection->connected_v6 = VARIANT_FALSE;
+            connection->connected_to_internet_v4 = connection->connected_to_internet_v6 = VARIANT_FALSE;
+        }
+    }
+    connectivity = get_connectivity( mgr );
+    LeaveCriticalSection( &mgr->cs );
+    if (connectivity != old_connectivity) notify_connectivity_changed( mgr, connectivity );
+    LeaveCriticalSection( &mgr->notify_cs );
 }
 
 static DWORD WINAPI monitor_proc( void *param )
@@ -2279,41 +2316,61 @@ static DWORD WINAPI monitor_proc( void *param )
     };
     HANDLE events[ARRAY_SIZE(subscriptions) + 1];
     NLM_CONNECTIVITY connectivity;
-    DWORD bytes, ret;
+    DWORD bytes, ret, err;
     unsigned int i;
+    BOOL ready = FALSE, failed = TRUE;
+    HRESULT hr;
 
     CoInitializeEx( NULL, COINIT_MULTITHREADED );
     events[0] = mgr->stop_event;
     for (i = 0; i < ARRAY_SIZE(subscriptions); i++)
     {
         subscriptions[i].overlapped.hEvent = events[i + 1] = CreateEventW( NULL, TRUE, FALSE, NULL );
-        arm_subscription( &subscriptions[i] );
+        if (!events[i + 1])
+        {
+            mgr->monitor_result = HRESULT_FROM_WIN32( GetLastError() );
+            goto done;
+        }
+        if ((err = arm_subscription( &subscriptions[i] )))
+        {
+            mgr->monitor_result = HRESULT_FROM_WIN32( err );
+            goto done;
+        }
     }
-    refresh_networks( mgr );
-    SetEvent( mgr->monitor_ready_event );
+    if (FAILED(mgr->monitor_result = refresh_networks( mgr, &connectivity ))) goto done;
+    if (!SetEvent( mgr->monitor_ready_event )) goto done;
+    ready = TRUE;
 
     for (;;)
     {
         ret = WaitForMultipleObjects( ARRAY_SIZE(events), events, FALSE, INFINITE );
-        if (ret == WAIT_OBJECT_0) break;
-        if (ret < WAIT_OBJECT_0 + 1 || ret >= WAIT_OBJECT_0 + ARRAY_SIZE(events)) break;
+        if (ret == WAIT_OBJECT_0) { failed = FALSE; break; }
+        if (ret < WAIT_OBJECT_0 + 1 || ret >= WAIT_OBJECT_0 + ARRAY_SIZE(events)) goto done;
 
-        if (WaitForSingleObject( mgr->stop_event, 150 ) == WAIT_OBJECT_0) break;
+        ret = WaitForSingleObject( mgr->stop_event, 150 );
+        if (ret == WAIT_OBJECT_0) { failed = FALSE; break; }
+        if (ret != WAIT_TIMEOUT) goto done;
         for (i = 0; i < ARRAY_SIZE(subscriptions); i++)
         {
-            if (WaitForSingleObject( subscriptions[i].overlapped.hEvent, 0 ) != WAIT_OBJECT_0) continue;
-            GetOverlappedResult( subscriptions[i].handle, &subscriptions[i].overlapped, &bytes, FALSE );
+            ret = WaitForSingleObject( subscriptions[i].overlapped.hEvent, 0 );
+            if (ret == WAIT_TIMEOUT) continue;
+            if (ret != WAIT_OBJECT_0) goto done;
+            if (subscriptions[i].pending &&
+                !GetOverlappedResult( subscriptions[i].handle, &subscriptions[i].overlapped, &bytes, FALSE ))
+                goto done;
             subscriptions[i].pending = FALSE;
-            arm_subscription( &subscriptions[i] );
+            if (arm_subscription( &subscriptions[i] )) goto done;
         }
 
         EnterCriticalSection( &mgr->notify_cs );
-        connectivity = refresh_networks( mgr );
+        hr = refresh_networks( mgr, &connectivity );
         if (connectivity != (NLM_CONNECTIVITY)-1) notify_connectivity_changed( mgr, connectivity );
         LeaveCriticalSection( &mgr->notify_cs );
-        if (InterlockedCompareExchange( &mgr->destroy_pending, 0, 0 )) break;
+        if (InterlockedCompareExchange( &mgr->destroy_pending, 0, 0 )) { failed = FALSE; break; }
+        if (FAILED(hr)) goto done;
     }
 
+done:
     for (i = 0; i < ARRAY_SIZE(subscriptions); i++)
     {
         if (subscriptions[i].pending)
@@ -2321,8 +2378,9 @@ static DWORD WINAPI monitor_proc( void *param )
             NsiCancelChangeNotification( &subscriptions[i].overlapped );
             GetOverlappedResult( subscriptions[i].handle, &subscriptions[i].overlapped, &bytes, TRUE );
         }
-        CloseHandle( subscriptions[i].overlapped.hEvent );
+        if (subscriptions[i].overlapped.hEvent) CloseHandle( subscriptions[i].overlapped.hEvent );
     }
+    if (ready && failed) downgrade_monitor( mgr );
     if (InterlockedCompareExchange( &mgr->destroy_pending, 0, 0 ) && mgr->destroy_tid == GetCurrentThreadId())
         list_manager_destroy( mgr );
     CoUninitialize();
@@ -2331,6 +2389,11 @@ static DWORD WINAPI monitor_proc( void *param )
 
 static HRESULT start_monitor( struct list_manager *mgr )
 {
+    HANDLE events[2];
+    DWORD ret;
+    HRESULT hr;
+
+    mgr->monitor_result = E_FAIL;
     if (!(mgr->stop_event = CreateEventW( NULL, TRUE, FALSE, NULL )) ||
         !(mgr->monitor_ready_event = CreateEventW( NULL, TRUE, FALSE, NULL )))
     {
@@ -2347,10 +2410,14 @@ static HRESULT start_monitor( struct list_manager *mgr )
         mgr->stop_event = mgr->monitor_ready_event = NULL;
         return HRESULT_FROM_WIN32( err );
     }
-    WaitForSingleObject( mgr->monitor_ready_event, INFINITE );
+    events[0] = mgr->monitor_ready_event;
+    events[1] = mgr->worker;
+    ret = WaitForMultipleObjects( ARRAY_SIZE(events), events, FALSE, INFINITE );
+    hr = ret == WAIT_OBJECT_0 ? S_OK : ret == WAIT_FAILED ? HRESULT_FROM_WIN32( GetLastError() ) : E_FAIL;
+    if (FAILED(hr)) stop_monitor( mgr );
     CloseHandle( mgr->monitor_ready_event );
     mgr->monitor_ready_event = NULL;
-    return S_OK;
+    return FAILED(mgr->monitor_result) ? mgr->monitor_result : hr;
 }
 
 static void stop_monitor( struct list_manager *mgr )
@@ -2436,9 +2503,16 @@ HRESULT list_manager_create( void **obj )
     connection_point_init( &mgr->events_cp, &IID_INetworkEvents,
                            &mgr->IConnectionPointContainer_iface );
 
+    /* Do not publish a dynamic manager until all five subscriptions and the
+     * initial reconciliation succeeded. Unsupported backends remain snapshots. */
+    if (mgr->dynamic_topology && FAILED(hr = start_monitor( mgr )))
+    {
+        list_manager_destroy( mgr );
+        return hr;
+    }
+    EnterCriticalSection( &mgr->cs );
     start_reachability_monitor( mgr );
-    if (FAILED(hr = start_monitor( mgr )))
-        WARN( "failed to start network monitor, hr %#lx\n", hr );
+    LeaveCriticalSection( &mgr->cs );
 
     *obj = &mgr->INetworkListManager_iface;
     TRACE( "returning iface %p\n", *obj );
