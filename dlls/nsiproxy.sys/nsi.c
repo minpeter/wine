@@ -206,7 +206,8 @@ static NTSTATUS poll_events(void)
 
         memset( &addr, 0, sizeof(addr) );
         addr.nl_family = AF_NETLINK;
-        addr.nl_groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+        addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR |
+                         RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE;
         if (bind( netlink_fd, (struct sockaddr *)&addr, sizeof(addr) ) == -1)
         {
             close( netlink_fd );
@@ -221,8 +222,10 @@ static NTSTATUS poll_events(void)
         len = recv( netlink_fd, buffer, sizeof(buffer), 0 );
         if (len <= 0)
         {
-            if (errno == EINTR) continue;
+            if (len == -1 && errno == EINTR) continue;
             ERR( "error receivng, len %d, errno %d.\n", len, errno );
+            close( netlink_fd );
+            netlink_fd = -1;
             return STATUS_UNSUCCESSFUL;
         }
         for (nlh = (struct nlmsghdr *)buffer; NLMSG_OK(nlh, len); nlh = NLMSG_NEXT(nlh, len))
@@ -241,6 +244,20 @@ static NTSTATUS poll_events(void)
                     continue;
                 }
                 if ((status = add_notification( module, NSI_IP_UNICAST_TABLE))) return status;
+            }
+            else if (nlh->nlmsg_type == RTM_NEWLINK || nlh->nlmsg_type == RTM_DELLINK)
+            {
+                if ((status = add_notification( &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE ))) return status;
+            }
+            else if (nlh->nlmsg_type == RTM_NEWROUTE || nlh->nlmsg_type == RTM_DELROUTE)
+            {
+                struct rtmsg *rtmsg = (struct rtmsg *)(nlh + 1);
+                const NPI_MODULEID *module;
+
+                if (rtmsg->rtm_family == AF_INET)       module = &NPI_MS_IPV4_MODULEID;
+                else if (rtmsg->rtm_family == AF_INET6) module = &NPI_MS_IPV6_MODULEID;
+                else continue;
+                if ((status = add_notification( module, NSI_IP_FORWARD_TABLE ))) return status;
             }
         }
         if (queued_notification_count) break;
@@ -283,10 +300,12 @@ static NTSTATUS poll_events(void)
         int len;
 
         len = recv( sock, &msg, sizeof(msg), 0 );
-        if (len < sizeof(msg))
+        if (len < (int)sizeof(msg))
         {
-            if (errno == EINTR) continue;
+            if (len == -1 && errno == EINTR) continue;
             ERR( "error receiving, len %d, errno %d.\n", len, errno );
+            close( sock );
+            sock = -1;
             return STATUS_UNSUCCESSFUL;
         }
 

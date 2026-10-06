@@ -23,6 +23,14 @@ import "objidl.idl";
 #define threading(model)
 #endif
 
+[
+    uuid(dcb00d01-570f-4a9b-8d69-199fdba5723b),
+    version(1.0)
+]
+library NetworkListManager
+{
+importlib("stdole2.tlb");
+
 interface IEnumNetworks;
 interface IEnumNetworkConnections;
 interface INetwork;
@@ -438,3 +446,5 @@ interface INetworkEvents : IUnknown
         [in] GUID networkId,
         [in] NLM_NETWORK_PROPERTY_CHANGE flags);
 }
+
+} /* library NetworkListManager */

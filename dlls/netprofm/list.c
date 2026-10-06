@@ -20,6 +20,7 @@
 #define COBJMACROS
 
 #include <stdarg.h>
+#include "ntstatus.h"
 #include "windef.h"
 #include "winbase.h"
 #include "winsock2.h"
@@ -27,17 +28,29 @@
 #include "iphlpapi.h"
 #include "ifdef.h"
 #include "netioapi.h"
-#include "initguid.h"
+#include "netiodef.h"
 #include "objbase.h"
 #include "ocidl.h"
-#include "netlistmgr.h"
 #include "olectl.h"
+#include "cguid.h"
+#include "initguid.h"
+#include "netlistmgr.h"
 
 #include "wine/debug.h"
 #include "wine/list.h"
+#include "wine/nsi.h"
+#include "wine/unixlib.h"
 #include "netprofm_private.h"
+#include "unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(netprofm);
+
+static const NPI_MODULEID npi_ndis_module =
+    {sizeof(NPI_MODULEID), MIT_GUID, {{0xeb004a11, 0x9b1a, 0x11d4, {0x91, 0x23, 0x00, 0x50, 0x04, 0x77, 0x59, 0xbc}}}};
+static const NPI_MODULEID npi_ipv4_module =
+    {sizeof(NPI_MODULEID), MIT_GUID, {{0xeb004a00, 0x9b1a, 0x11d4, {0x91, 0x23, 0x00, 0x50, 0x04, 0x77, 0x59, 0xbc}}}};
+static const NPI_MODULEID npi_ipv6_module =
+    {sizeof(NPI_MODULEID), MIT_GUID, {{0xeb004a01, 0x9b1a, 0x11d4, {0x91, 0x23, 0x00, 0x50, 0x04, 0x77, 0x59, 0xbc}}}};
 
 struct network
 {
@@ -60,6 +73,7 @@ struct connection
     struct list            entry;
     GUID                   id;
     INetwork              *network;
+    INetworkListManager   *mgr;
     VARIANT_BOOL           connected_to_internet_v4;
     VARIANT_BOOL           connected_to_internet_v6;
     VARIANT_BOOL           connected_v4;
@@ -87,14 +101,35 @@ struct list_manager
     struct connection_point cost_mgr_cp;
     struct connection_point conn_mgr_cp;
     struct connection_point events_cp;
+    CRITICAL_SECTION    cs;
+    CRITICAL_SECTION    notify_cs;
+    HANDLE              stop_event;
+    HANDLE              monitor_ready_event;
+    HRESULT             monitor_result;
+    HANDLE              worker;
+    DWORD               worker_tid;
+    HANDLE              reachability_stop_event;
+    HANDLE              reachability_worker;
+    DWORD               reachability_worker_tid;
+    UINT64              reachability_handle;
+    enum reachability_state reachability;
+    BOOL                dynamic_topology;
+    LONG                destroy_pending;
+    DWORD               destroy_tid;
 };
 
 struct sink_entry
 {
     struct list entry;
     DWORD cookie;
-    IUnknown *unk;
+    DWORD git_cookie;
 };
+
+static HRESULT start_monitor( struct list_manager *mgr );
+static void stop_monitor( struct list_manager *mgr );
+static void start_reachability_monitor( struct list_manager *mgr );
+static void stop_reachability_monitor( struct list_manager *mgr );
+static NLM_CONNECTIVITY get_connectivity( struct list_manager *mgr );
 
 static inline struct list_manager *impl_from_IConnectionPointContainer(IConnectionPointContainer *iface)
 {
@@ -186,38 +221,62 @@ static HRESULT WINAPI connection_point_Advise(
 {
     struct connection_point *cp = impl_from_IConnectionPoint( iface );
     struct sink_entry *sink_entry;
+    IGlobalInterfaceTable *git;
     IUnknown *unk;
     HRESULT hr;
 
-    FIXME( "%p, %p, %p - semi-stub\n", cp, sink, cookie );
+    TRACE( "%p, %p, %p\n", cp, sink, cookie );
 
     if (!sink || !cookie)
         return E_POINTER;
 
-    hr = IUnknown_QueryInterface( sink, &cp->iid, (void**)&unk );
+    sink_entry = malloc( sizeof(*sink_entry) );
+    if (!sink_entry) return E_OUTOFMEMORY;
+
+    hr = IUnknown_QueryInterface( sink, &cp->iid, (void **)&unk );
     if (FAILED(hr))
     {
         WARN( "iface %s not implemented by sink\n", debugstr_guid(&cp->iid) );
+        free( sink_entry );
         return CONNECT_E_CANNOTCONNECT;
     }
 
-    sink_entry = malloc( sizeof(*sink_entry) );
-    if (!sink_entry)
+    hr = CoCreateInstance( &CLSID_StdGlobalInterfaceTable, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_IGlobalInterfaceTable, (void **)&git );
+    if (SUCCEEDED(hr))
     {
-        IUnknown_Release( unk );
-        return E_OUTOFMEMORY;
+        hr = IGlobalInterfaceTable_RegisterInterfaceInGlobal( git, unk, &cp->iid,
+                                                              &sink_entry->git_cookie );
+        IGlobalInterfaceTable_Release( git );
+    }
+    IUnknown_Release( unk );
+    if (FAILED(hr))
+    {
+        WARN( "failed to marshal sink for %s, hr %#lx\n", debugstr_guid(&cp->iid), hr );
+        free( sink_entry );
+        return hr;
     }
 
-    sink_entry->unk = unk;
+    EnterCriticalSection( &impl_from_IConnectionPointContainer( cp->container )->cs );
     *cookie = sink_entry->cookie = ++cp->cookie;
     list_add_tail( &cp->sinks, &sink_entry->entry );
+    LeaveCriticalSection( &impl_from_IConnectionPointContainer( cp->container )->cs );
     return S_OK;
 }
 
 static void sink_entry_release( struct sink_entry *entry )
 {
-    list_remove( &entry->entry );
-    IUnknown_Release( entry->unk );
+    IGlobalInterfaceTable *git;
+    HRESULT hr;
+
+    hr = CoCreateInstance( &CLSID_StdGlobalInterfaceTable, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_IGlobalInterfaceTable, (void **)&git );
+    if (SUCCEEDED(hr))
+    {
+        hr = IGlobalInterfaceTable_RevokeInterfaceFromGlobal( git, entry->git_cookie );
+        IGlobalInterfaceTable_Release( git );
+    }
+    if (FAILED(hr)) WARN( "failed to revoke sink %#lx, hr %#lx\n", entry->git_cookie, hr );
     free( entry );
 }
 
@@ -226,16 +285,21 @@ static HRESULT WINAPI connection_point_Unadvise(
     DWORD cookie )
 {
     struct connection_point *cp = impl_from_IConnectionPoint( iface );
+    struct list_manager *mgr = impl_from_IConnectionPointContainer( cp->container );
     struct sink_entry *iter;
 
     TRACE( "%p, %ld\n", cp, cookie );
 
+    EnterCriticalSection( &mgr->cs );
     LIST_FOR_EACH_ENTRY( iter, &cp->sinks, struct sink_entry, entry )
     {
         if (iter->cookie != cookie) continue;
+        list_remove( &iter->entry );
+        LeaveCriticalSection( &mgr->cs );
         sink_entry_release( iter );
         return S_OK;
     }
+    LeaveCriticalSection( &mgr->cs );
 
     WARN( "invalid cookie\n" );
     return CONNECT_E_NOCONNECTION;
@@ -278,7 +342,11 @@ static void connection_point_init(
 static void connection_point_release( struct connection_point *cp )
 {
     while (!list_empty( &cp->sinks ))
-        sink_entry_release( LIST_ENTRY( list_head( &cp->sinks ), struct sink_entry, entry ) );
+    {
+        struct sink_entry *entry = LIST_ENTRY( list_head( &cp->sinks ), struct sink_entry, entry );
+        list_remove( &entry->entry );
+        sink_entry_release( entry );
+    }
 }
 
 static inline struct network *impl_from_INetwork(
@@ -314,9 +382,12 @@ static ULONG WINAPI network_AddRef(
     INetwork *iface )
 {
     struct network *network = impl_from_INetwork( iface );
+    ULONG refs;
 
     TRACE( "%p\n", network );
-    return InterlockedIncrement( &network->refs );
+    refs = InterlockedIncrement( &network->refs );
+    if (refs == 2) INetworkListManager_AddRef( network->mgr );
+    return refs;
 }
 
 static ULONG WINAPI network_Release(
@@ -327,10 +398,11 @@ static ULONG WINAPI network_Release(
 
     TRACE( "%p\n", network );
 
-    if (!(refs = InterlockedDecrement( &network->refs )))
+    refs = InterlockedDecrement( &network->refs );
+    if (refs == 1 && !INetworkListManager_Release( network->mgr )) refs = 0;
+    else if (!refs)
     {
         list_remove( &network->entry );
-        INetworkListManager_Release( network->mgr );
         free( network );
     }
     return refs;
@@ -472,10 +544,14 @@ static HRESULT WINAPI network_get_IsConnectedToInternet(
     VARIANT_BOOL *pbIsConnected )
 {
     struct network *network = impl_from_INetwork( iface );
+    struct list_manager *mgr = impl_from_INetworkListManager( network->mgr );
 
     TRACE( "%p, %p\n", iface, pbIsConnected );
 
-    *pbIsConnected = network->connected_to_internet_v4 | network->connected_to_internet_v6;
+    EnterCriticalSection( &mgr->cs );
+    *pbIsConnected = mgr->reachability == REACHABILITY_OFFLINE ? VARIANT_FALSE :
+            network->connected_to_internet_v4 | network->connected_to_internet_v6;
+    LeaveCriticalSection( &mgr->cs );
     TRACE( "<- %#x\n", *pbIsConnected );
     return S_OK;
 }
@@ -485,10 +561,13 @@ static HRESULT WINAPI network_get_IsConnected(
     VARIANT_BOOL *pbIsConnected )
 {
     struct network *network = impl_from_INetwork( iface );
+    struct list_manager *mgr = impl_from_INetworkListManager( network->mgr );
 
     TRACE( "%p, %p\n", iface, pbIsConnected );
 
+    EnterCriticalSection( &mgr->cs );
     *pbIsConnected = network->connected_v4 | network->connected_v6;
+    LeaveCriticalSection( &mgr->cs );
     TRACE( "<- %#x\n", *pbIsConnected );
     return S_OK;
 }
@@ -498,20 +577,23 @@ static HRESULT WINAPI network_GetConnectivity(
     NLM_CONNECTIVITY *pConnectivity )
 {
     struct network *network = impl_from_INetwork( iface );
+    struct list_manager *mgr = impl_from_INetworkListManager( network->mgr );
 
     TRACE( "%p, %p\n", iface, pConnectivity );
 
+    EnterCriticalSection( &mgr->cs );
     *pConnectivity = NLM_CONNECTIVITY_DISCONNECTED;
 
-    if (network->connected_to_internet_v4)
+    if (network->connected_to_internet_v4 && mgr->reachability != REACHABILITY_OFFLINE)
         *pConnectivity |= NLM_CONNECTIVITY_IPV4_INTERNET;
     else if (network->connected_v4)
         *pConnectivity |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
 
-    if (network->connected_to_internet_v6)
+    if (network->connected_to_internet_v6 && mgr->reachability != REACHABILITY_OFFLINE)
         *pConnectivity |= NLM_CONNECTIVITY_IPV6_INTERNET;
     else if (network->connected_v6)
         *pConnectivity |= NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
+    LeaveCriticalSection( &mgr->cs );
 
     TRACE( "<- %#x\n", *pConnectivity );
     return S_OK;
@@ -827,6 +909,7 @@ static HRESULT WINAPI networks_enum_Next(
     if (fetched) *fetched = 0;
     if (!count) return S_OK;
 
+    EnterCriticalSection( &iter->mgr->cs );
     while (iter->cursor && i < count)
     {
         struct network *network = LIST_ENTRY( iter->cursor, struct network, entry );
@@ -839,6 +922,7 @@ static HRESULT WINAPI networks_enum_Next(
         iter->cursor = list_next( &iter->mgr->networks, iter->cursor );
     }
     if (fetched) *fetched = i;
+    LeaveCriticalSection( &iter->mgr->cs );
 
     return i < count ? S_FALSE : S_OK;
 }
@@ -853,6 +937,7 @@ static HRESULT WINAPI networks_enum_Skip(
     if (!count) return S_OK;
     if (!iter->cursor) return S_FALSE;
 
+    EnterCriticalSection( &iter->mgr->cs );
     for (;;)
     {
         struct network *network;
@@ -862,6 +947,7 @@ static HRESULT WINAPI networks_enum_Skip(
         if (match_enum_network_flags( iter->flags, network )) count--;
         if (!count) break;
     }
+    LeaveCriticalSection( &iter->mgr->cs );
 
     return count ? S_FALSE : S_OK;
 }
@@ -873,7 +959,9 @@ static HRESULT WINAPI networks_enum_Reset(
 
     TRACE( "%p\n", iter );
 
+    EnterCriticalSection( &iter->mgr->cs );
     iter->cursor = list_head( &iter->mgr->networks );
+    LeaveCriticalSection( &iter->mgr->cs );
     return S_OK;
 }
 
@@ -914,7 +1002,9 @@ static HRESULT create_networks_enum(
     if (!(iter = calloc( 1, sizeof(*iter) ))) return E_OUTOFMEMORY;
 
     iter->IEnumNetworks_iface.lpVtbl = &networks_enum_vtbl;
+    EnterCriticalSection( &mgr->cs );
     iter->cursor = list_head( &mgr->networks );
+    LeaveCriticalSection( &mgr->cs );
     iter->mgr    = mgr;
     INetworkListManager_AddRef( &mgr->INetworkListManager_iface );
     iter->flags  = flags;
@@ -1051,6 +1141,7 @@ static HRESULT WINAPI connections_enum_Next(
     if (fetched) *fetched = 0;
     if (!count) return S_OK;
 
+    EnterCriticalSection( &iter->mgr->cs );
     while (iter->cursor && i < count)
     {
         struct connection *connection = LIST_ENTRY( iter->cursor, struct connection, entry );
@@ -1060,6 +1151,7 @@ static HRESULT WINAPI connections_enum_Next(
         i++;
     }
     if (fetched) *fetched = i;
+    LeaveCriticalSection( &iter->mgr->cs );
 
     return i < count ? S_FALSE : S_OK;
 }
@@ -1074,11 +1166,13 @@ static HRESULT WINAPI connections_enum_Skip(
     if (!count) return S_OK;
     if (!iter->cursor) return S_FALSE;
 
+    EnterCriticalSection( &iter->mgr->cs );
     while (count--)
     {
         iter->cursor = list_next( &iter->mgr->connections, iter->cursor );
         if (!iter->cursor) break;
     }
+    LeaveCriticalSection( &iter->mgr->cs );
 
     return count ? S_FALSE : S_OK;
 }
@@ -1090,7 +1184,9 @@ static HRESULT WINAPI connections_enum_Reset(
 
     TRACE( "%p\n", iter );
 
+    EnterCriticalSection( &iter->mgr->cs );
     iter->cursor = list_head( &iter->mgr->connections );
+    LeaveCriticalSection( &iter->mgr->cs );
     return S_OK;
 }
 
@@ -1130,7 +1226,9 @@ static HRESULT create_connections_enum(
     iter->IEnumNetworkConnections_iface.lpVtbl = &connections_enum_vtbl;
     iter->mgr         = mgr;
     INetworkListManager_AddRef( &mgr->INetworkListManager_iface );
+    EnterCriticalSection( &mgr->cs );
     iter->cursor      = list_head( &iter->mgr->connections );
+    LeaveCriticalSection( &mgr->cs );
     iter->refs        = 1;
 
     *ret = &iter->IEnumNetworkConnections_iface;
@@ -1144,6 +1242,32 @@ static ULONG WINAPI list_manager_AddRef(
     return InterlockedIncrement( &mgr->refs );
 }
 
+static void list_manager_destroy( struct list_manager *mgr )
+{
+    struct network *network, *next_network;
+    struct connection *connection, *next_connection;
+
+    TRACE( "destroying %p\n", mgr );
+
+    stop_reachability_monitor( mgr );
+    stop_monitor( mgr );
+    connection_point_release( &mgr->events_cp );
+    connection_point_release( &mgr->conn_mgr_cp );
+    connection_point_release( &mgr->cost_mgr_cp );
+    connection_point_release( &mgr->list_mgr_cp );
+    LIST_FOR_EACH_ENTRY_SAFE( connection, next_connection, &mgr->connections, struct connection, entry )
+    {
+        INetworkConnection_Release( &connection->INetworkConnection_iface );
+    }
+    LIST_FOR_EACH_ENTRY_SAFE( network, next_network, &mgr->networks, struct network, entry )
+    {
+        INetwork_Release( &network->INetwork_iface );
+    }
+    DeleteCriticalSection( &mgr->cs );
+    DeleteCriticalSection( &mgr->notify_cs );
+    free( mgr );
+}
+
 static ULONG WINAPI list_manager_Release(
     INetworkListManager *iface )
 {
@@ -1151,24 +1275,17 @@ static ULONG WINAPI list_manager_Release(
     LONG refs = InterlockedDecrement( &mgr->refs );
     if (!refs)
     {
-        struct network *network, *next_network;
-        struct connection *connection, *next_connection;
+        BOOL destroy_owner = !InterlockedCompareExchange( &mgr->destroy_pending, TRUE, FALSE );
 
-        TRACE( "destroying %p\n", mgr );
-
-        connection_point_release( &mgr->events_cp );
-        connection_point_release( &mgr->conn_mgr_cp );
-        connection_point_release( &mgr->cost_mgr_cp );
-        connection_point_release( &mgr->list_mgr_cp );
-        LIST_FOR_EACH_ENTRY_SAFE( connection, next_connection, &mgr->connections, struct connection, entry )
+        if (destroy_owner)
         {
-            INetworkConnection_Release( &connection->INetworkConnection_iface );
+            mgr->destroy_tid = GetCurrentThreadId();
+            if (mgr->stop_event) SetEvent( mgr->stop_event );
+            if (mgr->reachability_stop_event) SetEvent( mgr->reachability_stop_event );
         }
-        LIST_FOR_EACH_ENTRY_SAFE( network, next_network, &mgr->networks, struct network, entry )
-        {
-            INetwork_Release( &network->INetwork_iface );
-        }
-        free( mgr );
+        if (destroy_owner && mgr->worker_tid != GetCurrentThreadId() &&
+            mgr->reachability_worker_tid != GetCurrentThreadId())
+            list_manager_destroy( mgr );
     }
     return refs;
 }
@@ -1273,15 +1390,18 @@ static HRESULT WINAPI list_manager_GetNetwork(
 
     TRACE( "%p, %s, %p\n", iface, debugstr_guid(&gdNetworkId), ppNetwork );
 
+    EnterCriticalSection( &mgr->cs );
     LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
     {
         if (IsEqualGUID( &network->id, &gdNetworkId ))
         {
             *ppNetwork = &network->INetwork_iface;
             INetwork_AddRef( *ppNetwork );
+            LeaveCriticalSection( &mgr->cs );
             return S_OK;
         }
     }
+    LeaveCriticalSection( &mgr->cs );
 
     return S_FALSE;
 }
@@ -1307,15 +1427,18 @@ static HRESULT WINAPI list_manager_GetNetworkConnection(
     TRACE( "%p, %s, %p\n", iface, debugstr_guid(&gdNetworkConnectionId),
             ppNetworkConnection );
 
+    EnterCriticalSection( &mgr->cs );
     LIST_FOR_EACH_ENTRY( connection, &mgr->connections, struct connection, entry )
     {
         if (IsEqualGUID( &connection->id, &gdNetworkConnectionId ))
         {
             *ppNetworkConnection = &connection->INetworkConnection_iface;
             INetworkConnection_AddRef( *ppNetworkConnection );
+            LeaveCriticalSection( &mgr->cs );
             return S_OK;
         }
     }
+    LeaveCriticalSection( &mgr->cs );
 
     return S_FALSE;
 }
@@ -1329,16 +1452,20 @@ static HRESULT WINAPI list_manager_IsConnectedToInternet(
 
     TRACE( "%p, %p\n", iface, pbIsConnected );
 
+    EnterCriticalSection( &mgr->cs );
     LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
     {
-        if (network->connected_to_internet_v4 || network->connected_to_internet_v6)
+        if (mgr->reachability != REACHABILITY_OFFLINE &&
+            (network->connected_to_internet_v4 || network->connected_to_internet_v6))
         {
             *pbIsConnected = VARIANT_TRUE;
+            LeaveCriticalSection( &mgr->cs );
             return S_OK;
         }
     }
 
     *pbIsConnected = VARIANT_FALSE;
+    LeaveCriticalSection( &mgr->cs );
     return S_OK;
 }
 
@@ -1351,16 +1478,19 @@ static HRESULT WINAPI list_manager_IsConnected(
 
     TRACE( "%p, %p\n", iface, pbIsConnected );
 
+    EnterCriticalSection( &mgr->cs );
     LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
     {
         if (network->connected_v4 || network->connected_v6)
         {
             *pbIsConnected = VARIANT_TRUE;
+            LeaveCriticalSection( &mgr->cs );
             return S_OK;
         }
     }
 
     *pbIsConnected = VARIANT_FALSE;
+    LeaveCriticalSection( &mgr->cs );
     return S_OK;
 }
 
@@ -1369,24 +1499,12 @@ static HRESULT WINAPI list_manager_GetConnectivity(
     NLM_CONNECTIVITY *pConnectivity )
 {
     struct list_manager *mgr = impl_from_INetworkListManager( iface );
-    struct network *network;
 
     TRACE( "%p, %p\n", iface, pConnectivity );
 
-    *pConnectivity = NLM_CONNECTIVITY_DISCONNECTED;
-
-    LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
-    {
-        if (network->connected_to_internet_v4)
-            *pConnectivity |= NLM_CONNECTIVITY_IPV4_INTERNET;
-        else if (network->connected_v4)
-            *pConnectivity |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
-
-        if (network->connected_to_internet_v6)
-            *pConnectivity |= NLM_CONNECTIVITY_IPV6_INTERNET;
-        else if (network->connected_v6)
-            *pConnectivity |= NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
-    }
+    EnterCriticalSection( &mgr->cs );
+    *pConnectivity = get_connectivity( mgr );
+    LeaveCriticalSection( &mgr->cs );
 
     TRACE( "<- %#x\n", *pConnectivity );
     return S_OK;
@@ -1513,9 +1631,12 @@ static ULONG WINAPI connection_AddRef(
     INetworkConnection  *iface )
 {
     struct connection *connection = impl_from_INetworkConnection( iface );
+    ULONG refs;
 
     TRACE( "%p\n", connection );
-    return InterlockedIncrement( &connection->refs );
+    refs = InterlockedIncrement( &connection->refs );
+    if (refs == 2) INetworkListManager_AddRef( connection->mgr );
+    return refs;
 }
 
 static ULONG WINAPI connection_Release(
@@ -1526,10 +1647,11 @@ static ULONG WINAPI connection_Release(
 
     TRACE( "%p\n", connection );
 
-    if (!(refs = InterlockedDecrement( &connection->refs )))
+    refs = InterlockedDecrement( &connection->refs );
+    if (refs == 1 && !INetworkListManager_Release( connection->mgr )) refs = 0;
+    else if (!refs)
     {
         list_remove( &connection->entry );
-        INetwork_Release( connection->network );
         free( connection );
     }
     return refs;
@@ -1598,10 +1720,14 @@ static HRESULT WINAPI connection_get_IsConnectedToInternet(
     VARIANT_BOOL *pbIsConnected )
 {
     struct connection *connection = impl_from_INetworkConnection( iface );
+    struct list_manager *mgr = impl_from_INetworkListManager( connection->mgr );
 
     TRACE( "%p, %p\n", iface, pbIsConnected );
 
-    *pbIsConnected = connection->connected_to_internet_v4 | connection->connected_to_internet_v6;
+    EnterCriticalSection( &mgr->cs );
+    *pbIsConnected = mgr->reachability == REACHABILITY_OFFLINE ? VARIANT_FALSE :
+            connection->connected_to_internet_v4 | connection->connected_to_internet_v6;
+    LeaveCriticalSection( &mgr->cs );
     TRACE( "<- %#x\n", *pbIsConnected );
     return S_OK;
 }
@@ -1611,10 +1737,13 @@ static HRESULT WINAPI connection_get_IsConnected(
     VARIANT_BOOL *pbIsConnected )
 {
     struct connection *connection = impl_from_INetworkConnection( iface );
+    struct list_manager *mgr = impl_from_INetworkListManager( connection->mgr );
 
     TRACE( "%p, %p\n", iface, pbIsConnected );
 
+    EnterCriticalSection( &mgr->cs );
     *pbIsConnected = connection->connected_v4 | connection->connected_v6;
+    LeaveCriticalSection( &mgr->cs );
     TRACE( "<- %#x\n", *pbIsConnected );
     return S_OK;
 }
@@ -1624,20 +1753,23 @@ static HRESULT WINAPI connection_GetConnectivity(
     NLM_CONNECTIVITY *pConnectivity )
 {
     struct connection *connection = impl_from_INetworkConnection( iface );
+    struct list_manager *mgr = impl_from_INetworkListManager( connection->mgr );
 
     TRACE( "%p, %p\n", iface, pConnectivity );
 
+    EnterCriticalSection( &mgr->cs );
     *pConnectivity = NLM_CONNECTIVITY_DISCONNECTED;
 
-    if (connection->connected_to_internet_v4)
+    if (connection->connected_to_internet_v4 && mgr->reachability != REACHABILITY_OFFLINE)
         *pConnectivity |= NLM_CONNECTIVITY_IPV4_INTERNET;
     else if (connection->connected_v4)
         *pConnectivity |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
 
-    if (connection->connected_to_internet_v6)
+    if (connection->connected_to_internet_v6 && mgr->reachability != REACHABILITY_OFFLINE)
         *pConnectivity |= NLM_CONNECTIVITY_IPV6_INTERNET;
     else if (connection->connected_v6)
         *pConnectivity |= NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
+    LeaveCriticalSection( &mgr->cs );
 
     TRACE( "<- %#x\n", *pConnectivity );
     return S_OK;
@@ -1829,25 +1961,479 @@ static BOOL has_ipv4_address( const IP_ADAPTER_ADDRESSES *aa )
     return FALSE;
 }
 
-static BOOL has_ipv4_gateway_address( const IP_ADAPTER_ADDRESSES *aa )
+static enum default_route_state get_ipv4_default_route( const IP_ADAPTER_ADDRESSES *aa )
 {
-    const IP_ADAPTER_GATEWAY_ADDRESS *addr = aa->FirstGatewayAddress;
-    while (addr)
+    struct nsi_ipv4_forward_key *keys;
+    DWORD count, err, i;
+    enum default_route_state ret = DEFAULT_ROUTE_ABSENT;
+
+    err = NsiAllocateAndGetTable( 1, &npi_ipv4_module, NSI_IP_FORWARD_TABLE,
+                                  (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
+    if (err) return DEFAULT_ROUTE_UNAVAILABLE;
+    for (i = 0; i < count; i++)
     {
-        if (addr->Address.lpSockaddr->sa_family == AF_INET)
-            return TRUE;
-        addr = addr->Next;
+        if (keys[i].luid.Value == aa->Luid.Value && !keys[i].prefix_len)
+        {
+            ret = DEFAULT_ROUTE_PRESENT;
+            break;
+        }
     }
-    return FALSE;
+    NsiFreeTable( keys, NULL, NULL, NULL );
+    return ret;
+}
+
+static enum default_route_state get_ipv6_default_route( const IP_ADAPTER_ADDRESSES *aa )
+{
+    struct nsi_ipv6_forward_key *keys;
+    DWORD count, err, i;
+    enum default_route_state ret = DEFAULT_ROUTE_ABSENT;
+
+    err = NsiAllocateAndGetTable( 1, &npi_ipv6_module, NSI_WINE_IPV6_FORWARD_TABLE_STRICT,
+                                  (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
+    if (err) return DEFAULT_ROUTE_UNAVAILABLE;
+    for (i = 0; i < count; i++)
+    {
+        if (keys[i].luid.Value == aa->Luid.Value && !keys[i].prefix_len)
+        {
+            ret = DEFAULT_ROUTE_PRESENT;
+            break;
+        }
+    }
+    NsiFreeTable( keys, NULL, NULL, NULL );
+    return ret;
+}
+
+static BOOL has_ipv4_default_route( const IP_ADAPTER_ADDRESSES *aa )
+{
+    return get_ipv4_default_route( aa ) == DEFAULT_ROUTE_PRESENT;
+}
+
+static void set_network_connectivity( struct network *network, const IP_ADAPTER_ADDRESSES *aa,
+                                      BOOL dynamic_topology )
+{
+    const IP_ADAPTER_GATEWAY_ADDRESS *gateway;
+    BOOL has_local, has_global, connected_v4 = FALSE, connected_v6 = FALSE;
+    BOOL internet_v4 = FALSE, internet_v6 = FALSE;
+
+    if (aa && (!dynamic_topology || aa->OperStatus == IfOperStatusUp))
+    {
+        has_ipv6_address( aa, &has_local, &has_global );
+        connected_v6 = has_local || has_global;
+        connected_v4 = has_ipv4_address( aa );
+        if (dynamic_topology)
+        {
+            internet_v6 = ipv6_has_internet( has_global, get_ipv6_default_route( aa ) );
+            internet_v4 = connected_v4 && has_ipv4_default_route( aa );
+        }
+        else
+        {
+            /* Preserve the snapshot policy on backends without link/route monitoring. */
+            internet_v6 = has_global;
+            for (gateway = aa->FirstGatewayAddress; gateway; gateway = gateway->Next)
+                if (gateway->Address.lpSockaddr->sa_family == AF_INET) internet_v4 = TRUE;
+        }
+    }
+    network->connected_v4 = connected_v4 ? VARIANT_TRUE : VARIANT_FALSE;
+    network->connected_v6 = connected_v6 ? VARIANT_TRUE : VARIANT_FALSE;
+    network->connected_to_internet_v4 = internet_v4 ? VARIANT_TRUE : VARIANT_FALSE;
+    network->connected_to_internet_v6 = internet_v6 ? VARIANT_TRUE : VARIANT_FALSE;
+}
+
+static NLM_CONNECTIVITY get_connectivity( struct list_manager *mgr )
+{
+    NLM_CONNECTIVITY connectivity = NLM_CONNECTIVITY_DISCONNECTED;
+    struct network *network;
+
+    LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
+    {
+        if (network->connected_to_internet_v4 && mgr->reachability != REACHABILITY_OFFLINE)
+            connectivity |= NLM_CONNECTIVITY_IPV4_INTERNET;
+        else if (network->connected_v4)
+            connectivity |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
+
+        if (network->connected_to_internet_v6 && mgr->reachability != REACHABILITY_OFFLINE)
+            connectivity |= NLM_CONNECTIVITY_IPV6_INTERNET;
+        else if (network->connected_v6)
+            connectivity |= NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
+    }
+    return connectivity;
+}
+
+static IP_ADAPTER_ADDRESSES *find_adapter( IP_ADAPTER_ADDRESSES *buf, const GUID *id )
+{
+    IP_ADAPTER_ADDRESSES *aa;
+
+    for (aa = buf; aa; aa = aa->Next)
+    {
+        NET_LUID luid;
+        GUID adapter_id;
+
+        if (!wcscmp( aa->FriendlyName, L"lo" )) continue;
+        if (ConvertInterfaceIndexToLuid( aa->IfIndex, &luid )) continue;
+        if (ConvertInterfaceLuidToGuid( &luid, &adapter_id )) continue;
+        if (IsEqualGUID( id, &adapter_id )) return aa;
+    }
+    return NULL;
+}
+
+static HRESULT refresh_networks( struct list_manager *mgr, NLM_CONNECTIVITY *changed )
+{
+    IP_ADAPTER_ADDRESSES *buf, *aa;
+    struct network *network;
+    struct connection *connection;
+    NET_LUID luid;
+    GUID id;
+    NLM_CONNECTIVITY old_connectivity, connectivity;
+
+    *changed = (NLM_CONNECTIVITY)-1;
+    if (!(buf = get_network_adapters())) return E_OUTOFMEMORY;
+
+    EnterCriticalSection( &mgr->cs );
+    old_connectivity = get_connectivity( mgr );
+    LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
+    {
+        set_network_connectivity( network, find_adapter( buf, &network->id ), mgr->dynamic_topology );
+        LIST_FOR_EACH_ENTRY( connection, &mgr->connections, struct connection, entry )
+        {
+            if (!IsEqualGUID( &connection->id, &network->id )) continue;
+            connection->connected_v4 = network->connected_v4;
+            connection->connected_v6 = network->connected_v6;
+            connection->connected_to_internet_v4 = network->connected_to_internet_v4;
+            connection->connected_to_internet_v6 = network->connected_to_internet_v6;
+            break;
+        }
+    }
+
+    for (aa = buf; aa; aa = aa->Next)
+    {
+        if (!wcscmp( aa->FriendlyName, L"lo" )) continue;
+        if (ConvertInterfaceIndexToLuid( aa->IfIndex, &luid )) continue;
+        if (ConvertInterfaceLuidToGuid( &luid, &id )) continue;
+
+        LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
+            if (IsEqualGUID( &network->id, &id )) break;
+        if (&network->entry != &mgr->networks) continue;
+
+        if (!(network = create_network( &id ))) continue;
+        if (!(connection = create_connection( &id )))
+        {
+            INetwork_Release( &network->INetwork_iface );
+            continue;
+        }
+
+        network->mgr = &mgr->INetworkListManager_iface;
+        connection->network = &network->INetwork_iface;
+        connection->mgr = &mgr->INetworkListManager_iface;
+        set_network_connectivity( network, aa, mgr->dynamic_topology );
+        connection->connected_v4 = network->connected_v4;
+        connection->connected_v6 = network->connected_v6;
+        connection->connected_to_internet_v4 = network->connected_to_internet_v4;
+        connection->connected_to_internet_v6 = network->connected_to_internet_v6;
+        list_add_tail( &mgr->networks, &network->entry );
+        list_add_tail( &mgr->connections, &connection->entry );
+    }
+    connectivity = get_connectivity( mgr );
+    LeaveCriticalSection( &mgr->cs );
+    free( buf );
+
+    if (connectivity != old_connectivity) *changed = connectivity;
+    return S_OK;
+}
+
+static void notify_connectivity_changed( struct list_manager *mgr, NLM_CONNECTIVITY connectivity )
+{
+    IGlobalInterfaceTable *git;
+    DWORD *cookies;
+    struct sink_entry *entry;
+    unsigned int count = 0, i = 0;
+    HRESULT hr;
+
+    INetworkListManager_AddRef( &mgr->INetworkListManager_iface );
+    EnterCriticalSection( &mgr->cs );
+    LIST_FOR_EACH_ENTRY( entry, &mgr->list_mgr_cp.sinks, struct sink_entry, entry ) count++;
+    if (!(cookies = calloc( count, sizeof(*cookies) ))) count = 0;
+    else LIST_FOR_EACH_ENTRY( entry, &mgr->list_mgr_cp.sinks, struct sink_entry, entry )
+        cookies[i++] = entry->git_cookie;
+    LeaveCriticalSection( &mgr->cs );
+
+    hr = CoCreateInstance( &CLSID_StdGlobalInterfaceTable, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_IGlobalInterfaceTable, (void **)&git );
+    if (SUCCEEDED(hr))
+    {
+        for (i = 0; i < count && !InterlockedCompareExchange( &mgr->destroy_pending, 0, 0 ); i++)
+        {
+            INetworkListManagerEvents *sink;
+
+            hr = IGlobalInterfaceTable_GetInterfaceFromGlobal( git, cookies[i],
+                    &IID_INetworkListManagerEvents, (void **)&sink );
+            if (FAILED(hr)) continue;
+            INetworkListManagerEvents_ConnectivityChanged( sink, connectivity );
+            INetworkListManagerEvents_Release( sink );
+        }
+        IGlobalInterfaceTable_Release( git );
+    }
+    free( cookies );
+    INetworkListManager_Release( &mgr->INetworkListManager_iface );
+}
+
+static void update_reachability( struct list_manager *mgr, enum reachability_state state )
+{
+    NLM_CONNECTIVITY old_connectivity, connectivity;
+
+    EnterCriticalSection( &mgr->notify_cs );
+    EnterCriticalSection( &mgr->cs );
+    old_connectivity = get_connectivity( mgr );
+    mgr->reachability = state;
+    connectivity = get_connectivity( mgr );
+    LeaveCriticalSection( &mgr->cs );
+
+    if (connectivity != old_connectivity) notify_connectivity_changed( mgr, connectivity );
+    LeaveCriticalSection( &mgr->notify_cs );
+}
+
+static DWORD WINAPI reachability_monitor_proc( void *param )
+{
+    struct list_manager *mgr = param;
+    struct reachability_wait_params params = {mgr->reachability_handle};
+    NTSTATUS status;
+    DWORD ret;
+
+    CoInitializeEx( NULL, COINIT_MULTITHREADED );
+    while ((ret = WaitForSingleObject( mgr->reachability_stop_event, 0 )) == WAIT_TIMEOUT)
+    {
+        status = UNIX_CALL( reachability_wait, &params );
+        if (status) break;
+        if (params.changed) update_reachability( mgr, params.state );
+    }
+    if (ret != WAIT_OBJECT_0) update_reachability( mgr, REACHABILITY_INDETERMINATE );
+    if (InterlockedCompareExchange( &mgr->destroy_pending, 0, 0 ) && mgr->destroy_tid == GetCurrentThreadId())
+        list_manager_destroy( mgr );
+    CoUninitialize();
+    return 0;
+}
+
+static void start_reachability_monitor( struct list_manager *mgr )
+{
+    struct reachability_start_params params = {0};
+
+    mgr->reachability = REACHABILITY_INDETERMINATE;
+    if (UNIX_CALL( reachability_start, &params )) return;
+    mgr->reachability = params.state;
+    mgr->reachability_handle = params.handle;
+
+    if (!(mgr->reachability_stop_event = CreateEventW( NULL, TRUE, FALSE, NULL )) ||
+        !(mgr->reachability_worker = CreateThread( NULL, 0, reachability_monitor_proc, mgr, 0,
+                                                   &mgr->reachability_worker_tid )))
+    {
+        struct reachability_stop_params stop_params = {mgr->reachability_handle};
+        if (mgr->reachability_stop_event) CloseHandle( mgr->reachability_stop_event );
+        mgr->reachability_stop_event = NULL;
+        UNIX_CALL( reachability_stop, &stop_params );
+        mgr->reachability_handle = 0;
+        mgr->reachability = REACHABILITY_INDETERMINATE;
+    }
+}
+
+static void stop_reachability_monitor( struct list_manager *mgr )
+{
+    struct reachability_stop_params params;
+
+    if (!mgr->reachability_handle) return;
+    SetEvent( mgr->reachability_stop_event );
+    if (mgr->reachability_worker_tid != GetCurrentThreadId())
+        WaitForSingleObject( mgr->reachability_worker, INFINITE );
+    CloseHandle( mgr->reachability_worker );
+    CloseHandle( mgr->reachability_stop_event );
+    params.handle = mgr->reachability_handle;
+    UNIX_CALL( reachability_stop, &params );
+    mgr->reachability_worker = mgr->reachability_stop_event = NULL;
+    mgr->reachability_handle = 0;
+}
+
+struct monitor_subscription
+{
+    const NPI_MODULEID *module;
+    UINT table;
+    OVERLAPPED overlapped;
+    HANDLE handle;
+    BOOL pending;
+};
+
+static DWORD arm_subscription( struct monitor_subscription *subscription )
+{
+    DWORD err;
+
+    if (!ResetEvent( subscription->overlapped.hEvent )) return GetLastError();
+    err = NsiRequestChangeNotification( 0, subscription->module, subscription->table,
+                                        &subscription->overlapped, &subscription->handle );
+    subscription->pending = err == ERROR_IO_PENDING;
+    if (err && err != ERROR_IO_PENDING)
+        WARN( "failed to subscribe to NSI table %u, error %lu\n", subscription->table, err );
+    /* A synchronous completion is a change, not an outstanding subscription. */
+    if (!err && !SetEvent( subscription->overlapped.hEvent )) return GetLastError();
+    return err == ERROR_IO_PENDING ? ERROR_SUCCESS : err;
+}
+
+static void downgrade_monitor( struct list_manager *mgr )
+{
+    struct network *network;
+    struct connection *connection;
+    NLM_CONNECTIVITY old_connectivity, connectivity;
+
+    WARN( "network monitor failed, switching to snapshot policy\n" );
+    EnterCriticalSection( &mgr->notify_cs );
+    EnterCriticalSection( &mgr->cs );
+    old_connectivity = get_connectivity( mgr );
+    mgr->dynamic_topology = FALSE;
+    if (FAILED(refresh_networks( mgr, &connectivity )))
+    {
+        /* No snapshot is available. Do not retain an unmonitored Internet
+         * classification indefinitely after a fatal monitor failure. */
+        LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
+            set_network_connectivity( network, NULL, FALSE );
+        LIST_FOR_EACH_ENTRY( connection, &mgr->connections, struct connection, entry )
+        {
+            connection->connected_v4 = connection->connected_v6 = VARIANT_FALSE;
+            connection->connected_to_internet_v4 = connection->connected_to_internet_v6 = VARIANT_FALSE;
+        }
+    }
+    connectivity = get_connectivity( mgr );
+    LeaveCriticalSection( &mgr->cs );
+    if (connectivity != old_connectivity) notify_connectivity_changed( mgr, connectivity );
+    LeaveCriticalSection( &mgr->notify_cs );
+}
+
+static DWORD WINAPI monitor_proc( void *param )
+{
+    struct list_manager *mgr = param;
+    struct monitor_subscription subscriptions[] =
+    {
+        { &npi_ndis_module, NSI_NDIS_IFINFO_TABLE },
+        { &npi_ipv4_module, NSI_IP_UNICAST_TABLE },
+        { &npi_ipv6_module, NSI_IP_UNICAST_TABLE },
+        { &npi_ipv4_module, NSI_IP_FORWARD_TABLE },
+        { &npi_ipv6_module, NSI_IP_FORWARD_TABLE },
+    };
+    HANDLE events[ARRAY_SIZE(subscriptions) + 1];
+    NLM_CONNECTIVITY connectivity;
+    DWORD bytes, ret, err;
+    unsigned int i;
+    BOOL ready = FALSE, failed = TRUE;
+    HRESULT hr;
+
+    CoInitializeEx( NULL, COINIT_MULTITHREADED );
+    events[0] = mgr->stop_event;
+    for (i = 0; i < ARRAY_SIZE(subscriptions); i++)
+    {
+        subscriptions[i].overlapped.hEvent = events[i + 1] = CreateEventW( NULL, TRUE, FALSE, NULL );
+        if (!events[i + 1])
+        {
+            mgr->monitor_result = HRESULT_FROM_WIN32( GetLastError() );
+            goto done;
+        }
+        if ((err = arm_subscription( &subscriptions[i] )))
+        {
+            mgr->monitor_result = HRESULT_FROM_WIN32( err );
+            goto done;
+        }
+    }
+    if (FAILED(mgr->monitor_result = refresh_networks( mgr, &connectivity ))) goto done;
+    if (!SetEvent( mgr->monitor_ready_event )) goto done;
+    ready = TRUE;
+
+    for (;;)
+    {
+        ret = WaitForMultipleObjects( ARRAY_SIZE(events), events, FALSE, INFINITE );
+        if (ret == WAIT_OBJECT_0) { failed = FALSE; break; }
+        if (ret < WAIT_OBJECT_0 + 1 || ret >= WAIT_OBJECT_0 + ARRAY_SIZE(events)) goto done;
+
+        ret = WaitForSingleObject( mgr->stop_event, 150 );
+        if (ret == WAIT_OBJECT_0) { failed = FALSE; break; }
+        if (ret != WAIT_TIMEOUT) goto done;
+        for (i = 0; i < ARRAY_SIZE(subscriptions); i++)
+        {
+            ret = WaitForSingleObject( subscriptions[i].overlapped.hEvent, 0 );
+            if (ret == WAIT_TIMEOUT) continue;
+            if (ret != WAIT_OBJECT_0) goto done;
+            if (subscriptions[i].pending &&
+                !GetOverlappedResult( subscriptions[i].handle, &subscriptions[i].overlapped, &bytes, FALSE ))
+                goto done;
+            subscriptions[i].pending = FALSE;
+            if (arm_subscription( &subscriptions[i] )) goto done;
+        }
+
+        EnterCriticalSection( &mgr->notify_cs );
+        hr = refresh_networks( mgr, &connectivity );
+        if (connectivity != (NLM_CONNECTIVITY)-1) notify_connectivity_changed( mgr, connectivity );
+        LeaveCriticalSection( &mgr->notify_cs );
+        if (InterlockedCompareExchange( &mgr->destroy_pending, 0, 0 )) { failed = FALSE; break; }
+        if (FAILED(hr)) goto done;
+    }
+
+done:
+    for (i = 0; i < ARRAY_SIZE(subscriptions); i++)
+    {
+        if (subscriptions[i].pending)
+        {
+            NsiCancelChangeNotification( &subscriptions[i].overlapped );
+            GetOverlappedResult( subscriptions[i].handle, &subscriptions[i].overlapped, &bytes, TRUE );
+        }
+        if (subscriptions[i].overlapped.hEvent) CloseHandle( subscriptions[i].overlapped.hEvent );
+    }
+    if (ready && failed) downgrade_monitor( mgr );
+    if (InterlockedCompareExchange( &mgr->destroy_pending, 0, 0 ) && mgr->destroy_tid == GetCurrentThreadId())
+        list_manager_destroy( mgr );
+    CoUninitialize();
+    return 0;
+}
+
+static HRESULT start_monitor( struct list_manager *mgr )
+{
+    HANDLE events[2];
+    DWORD ret;
+    HRESULT hr;
+
+    mgr->monitor_result = E_FAIL;
+    if (!(mgr->stop_event = CreateEventW( NULL, TRUE, FALSE, NULL )) ||
+        !(mgr->monitor_ready_event = CreateEventW( NULL, TRUE, FALSE, NULL )))
+    {
+        DWORD err = GetLastError();
+        if (mgr->stop_event) CloseHandle( mgr->stop_event );
+        mgr->stop_event = NULL;
+        return HRESULT_FROM_WIN32( err );
+    }
+    if (!(mgr->worker = CreateThread( NULL, 0, monitor_proc, mgr, 0, &mgr->worker_tid )))
+    {
+        DWORD err = GetLastError();
+        CloseHandle( mgr->stop_event );
+        CloseHandle( mgr->monitor_ready_event );
+        mgr->stop_event = mgr->monitor_ready_event = NULL;
+        return HRESULT_FROM_WIN32( err );
+    }
+    events[0] = mgr->monitor_ready_event;
+    events[1] = mgr->worker;
+    ret = WaitForMultipleObjects( ARRAY_SIZE(events), events, FALSE, INFINITE );
+    hr = ret == WAIT_OBJECT_0 ? S_OK : ret == WAIT_FAILED ? HRESULT_FROM_WIN32( GetLastError() ) : E_FAIL;
+    if (FAILED(hr)) stop_monitor( mgr );
+    CloseHandle( mgr->monitor_ready_event );
+    mgr->monitor_ready_event = NULL;
+    return FAILED(mgr->monitor_result) ? mgr->monitor_result : hr;
+}
+
+static void stop_monitor( struct list_manager *mgr )
+{
+    if (!mgr->worker) return;
+    SetEvent( mgr->stop_event );
+    if (mgr->worker_tid != GetCurrentThreadId()) WaitForSingleObject( mgr->worker, INFINITE );
+    CloseHandle( mgr->worker );
+    CloseHandle( mgr->stop_event );
+    mgr->worker = mgr->stop_event = NULL;
 }
 
 static void init_networks( struct list_manager *mgr )
 {
-    BOOL has_local, has_global;
     IP_ADAPTER_ADDRESSES *buf, *aa;
     GUID id;
-
-    FIXME( "no support for detecting network changes\n" );
 
     list_init( &mgr->networks );
     list_init( &mgr->connections );
@@ -1874,32 +2460,14 @@ static void init_networks( struct list_manager *mgr )
             goto done;
         }
 
-        has_ipv6_address( aa, &has_local, &has_global );
-        if (has_local || has_global)
-        {
-            network->connected_v6 = VARIANT_TRUE;
-            connection->connected_v6 = VARIANT_TRUE;
-        }
-        if (has_global)
-        {
-            network->connected_to_internet_v6 = VARIANT_TRUE;
-            connection->connected_to_internet_v6 = VARIANT_TRUE;
-        }
-        if (has_ipv4_address( aa ))
-        {
-            network->connected_v4 = VARIANT_TRUE;
-            connection->connected_v4 = VARIANT_TRUE;
-        }
-        if (has_ipv4_gateway_address( aa ))
-        {
-            network->connected_to_internet_v4 = VARIANT_TRUE;
-            connection->connected_to_internet_v4 = VARIANT_TRUE;
-        }
-
+        set_network_connectivity( network, aa, mgr->dynamic_topology );
+        connection->connected_v4 = network->connected_v4;
+        connection->connected_v6 = network->connected_v6;
+        connection->connected_to_internet_v4 = network->connected_to_internet_v4;
+        connection->connected_to_internet_v6 = network->connected_to_internet_v6;
         network->mgr = &mgr->INetworkListManager_iface;
-        INetworkListManager_AddRef( network->mgr );
         connection->network = &network->INetwork_iface;
-        INetwork_AddRef( connection->network );
+        connection->mgr = &mgr->INetworkListManager_iface;
 
         list_add_tail( &mgr->networks, &network->entry );
         list_add_tail( &mgr->connections, &connection->entry );
@@ -1912,6 +2480,7 @@ done:
 HRESULT list_manager_create( void **obj )
 {
     struct list_manager *mgr;
+    HRESULT hr;
 
     TRACE( "%p\n", obj );
 
@@ -1919,8 +2488,11 @@ HRESULT list_manager_create( void **obj )
     mgr->INetworkListManager_iface.lpVtbl = &list_manager_vtbl;
     mgr->INetworkCostManager_iface.lpVtbl = &cost_manager_vtbl;
     mgr->IConnectionPointContainer_iface.lpVtbl = &cpc_vtbl;
-    init_networks( mgr );
     mgr->refs = 1;
+    InitializeCriticalSection( &mgr->cs );
+    InitializeCriticalSection( &mgr->notify_cs );
+    mgr->dynamic_topology = !UNIX_CALL( topology_supported, NULL );
+    init_networks( mgr );
 
     connection_point_init( &mgr->list_mgr_cp, &IID_INetworkListManagerEvents,
                            &mgr->IConnectionPointContainer_iface );
@@ -1930,6 +2502,17 @@ HRESULT list_manager_create( void **obj )
                            &mgr->IConnectionPointContainer_iface );
     connection_point_init( &mgr->events_cp, &IID_INetworkEvents,
                            &mgr->IConnectionPointContainer_iface );
+
+    /* Do not publish a dynamic manager until all five subscriptions and the
+     * initial reconciliation succeeded. Unsupported backends remain snapshots. */
+    if (mgr->dynamic_topology && FAILED(hr = start_monitor( mgr )))
+    {
+        list_manager_destroy( mgr );
+        return hr;
+    }
+    EnterCriticalSection( &mgr->cs );
+    start_reachability_monitor( mgr );
+    LeaveCriticalSection( &mgr->cs );
 
     *obj = &mgr->INetworkListManager_iface;
     TRACE( "returning iface %p\n", *obj );
