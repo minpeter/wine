@@ -2,6 +2,7 @@ MODULE    = netprofm.dll
 UNIXLIB   = netprofm.so
 IMPORTS   = uuid iphlpapi nsi ole32
 UNIX_CFLAGS  = $(DBUS_CFLAGS)
+UNIX_LIBS = $(PTHREAD_LIBS)
 
 SOURCES = \
 	list.c \
