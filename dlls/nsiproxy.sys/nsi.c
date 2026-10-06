@@ -222,8 +222,10 @@ static NTSTATUS poll_events(void)
         len = recv( netlink_fd, buffer, sizeof(buffer), 0 );
         if (len <= 0)
         {
-            if (errno == EINTR) continue;
+            if (len == -1 && errno == EINTR) continue;
             ERR( "error receivng, len %d, errno %d.\n", len, errno );
+            close( netlink_fd );
+            netlink_fd = -1;
             return STATUS_UNSUCCESSFUL;
         }
         for (nlh = (struct nlmsghdr *)buffer; NLMSG_OK(nlh, len); nlh = NLMSG_NEXT(nlh, len))
@@ -298,10 +300,12 @@ static NTSTATUS poll_events(void)
         int len;
 
         len = recv( sock, &msg, sizeof(msg), 0 );
-        if (len < sizeof(msg))
+        if (len < (int)sizeof(msg))
         {
-            if (errno == EINTR) continue;
+            if (len == -1 && errno == EINTR) continue;
             ERR( "error receiving, len %d, errno %d.\n", len, errno );
+            close( sock );
+            sock = -1;
             return STATUS_UNSUCCESSFUL;
         }
 
