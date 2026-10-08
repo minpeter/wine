@@ -52,9 +52,11 @@ device-host/system-bus recovery proof.
 
 ## Current verification status
 
-**The paired-module build and Linux overlay regression QA passed. Workstation
-Bottles/application QA is pending.** Previous 11.0-28 results and official
-11.0-10 baseline GUI results are not candidate GUI results.
+**The paired-module build and Linux overlay regressions passed. Workstation QA
+reports candidate Bottles, clean/upgraded-prefix NLM and GUI/input checks passed.**
+Previous 11.0-28 results and official 11.0-10 baseline results are not substituted
+for these candidate checks. Global candidate installation is still separate;
+no switch of the live application is claimed.
 
 Executed for this variant:
 
@@ -129,12 +131,41 @@ policy cases on both architectures; those test-only libraries are not delivered.
 Namespace topology and passive fake-NM fixtures do not prove physical network
 outage/suspend or whole-Wine device-host/system-bus recovery.
 
-Workstation Bottles, upgraded-prefix typelib registration, real GUI/input and
-application checks remain separate pending QA. An existing prefix with no NLM
-typelib needs registration checked explicitly; a clean-prefix pass is insufficient.
-ARM64 compilation/runtime, authenticated application login, application scrolling
-and application media playback are not claimed. Keep graphics ABI overrides out
-of the global Bottles/Python environment and preserve existing user data/settings.
+### Separate workstation QA (reported by the workstation QA owner)
+
+The actual candidate was assembled from the freshly downloaded official archive
+and the same hash-checked eight modules. All 4,479 unaffected files matched the
+official archive; exactly six replacements and two additions matched the handoff.
+The following checks passed for both x64 and traditional i386:
+
+* Clean disposable-prefix NLM: 125 assertions, zero failures/skips and eight
+  inherited todos per architecture. Counts depend on the enumerated host topology.
+* A genuinely original official-runner prefix had no NLM typelib. Normal candidate
+  `wineboot -u` registered typelib version 1.0 and the universal marshaler in both
+  registry views; upgraded-prefix NLM then passed 125 assertions with the same
+  zero failures/skips and inherited todos. No live account prefix was copied.
+* Native Bottles namespace STA/topology: 200 assertions; private passive fake-NM
+  and reconnect: 136 assertions. Zero failures/skips/flaky, with twelve inherited
+  todos total per architecture. Only the private launch adapter's hardcoded win32
+  selection needed correction to use the requested `WINEARCH`; no Wine source fix.
+* Private native edit-control input fixture: seven real X11 wheel events, normal
+  WinAPI F6 minimize/restore, focus recovery, retained scroll position and subsequent
+  wheel movement to offset 21. Four architecture/state screenshots were inspected
+  by the workstation QA owner. This is native Wine input QA, not Qt/chat scrolling.
+
+The candidate also rendered an account-free application's empty Qt login surface
+and normal WinAPI minimize/restore state; screenshots were inspected by the
+workstation QA owner. Candidate loader mappings and host Mesa GL were verified;
+no account/chat contents were captured and no OpenGL error was reported. This is
+rendering/restore coverage, not authenticated login or application media playback.
+The live application, its existing runner, settings and data remained untouched
+during this disposable candidate QA. Workstation logs/screenshots remain private.
+
+ARM64 compilation/runtime, physical outage/suspend, authenticated application
+login, application scrolling and application media playback are not claimed.
+Keep graphics ABI overrides out of the global Bottles/Python environment and
+preserve existing user data/settings. Installation or switching an existing
+live bottle is a separate operation, not implied by these QA passes.
 
 ## Reproduce focused checks
 
