@@ -52,9 +52,9 @@ device-host/system-bus recovery proof.
 
 ## Current verification status
 
-**Full stable build and runtime QA are pending.** Do not interpret the previous
-11.0-28 variant's passes or the official 11.0-10 runner's QA as candidate results.
-This source branch is published independently of binary delivery.
+**The paired-module build and Linux overlay regression QA passed. Workstation
+Bottles/application QA is pending.** Previous 11.0-28 results and official
+11.0-10 baseline GUI results are not candidate GUI results.
 
 Executed for this variant:
 
@@ -68,27 +68,81 @@ Executed for this variant:
   context/footer bytes, which are intentionally retained. Imported wineopenxr
   contains inherited generator trailing whitespace, not introduced by this branch.
 
-A separate **non-PGO** traditional split x64/i386 runner build is in progress
-using the stable TKG configuration and a retained isolated Ubuntu24.04 dependency
-overlay, not host package changes. Native/CROSS optimization flags, Wayland,
-Vulkan, OpenGL, FFmpeg and GStreamer are retained; i386 wineopenxr is disabled
-as in the original recipe. Tests are enabled and ccache is disabled for validation.
-The official stable release used measured PGO; this candidate does not claim that
-PGO training/gating was reproduced. The overlay is not a pinned OCI image: retain
-actual package-version and apt-source manifests alongside any private build.
+### Delivery: official PGO runtime plus only the changed network owners
 
-Planned candidate checks: ordinary NLM/NSI/IPHelper; topology/carrier/on-link;
-strict IPv6 unavailable; monitor/snapshot faults; malformed/authenticated D-Bus;
-real NSI faults; both architectures' STA and passive NM reconnect; no-D-Bus.
-ARM64 compile/runtime and physical network outage/suspend coverage are not claimed.
-Application GUI/media behavior requires separate disposable-prefix workstation QA.
+The candidate uses the official **soda-11.0-10-x86_64** archive, 174028776 bytes,
+SHA256 `14633fabd180d308d2c1ebcb84a16f36d0484dded5809c64f8a7c93e654d7296`.
+Extract it into a distinct runner directory before applying the overlay.
+Only both architectures' `netprofm.dll`, `nsiproxy.sys`, `nsiproxy.so` are replaced;
+both `netprofm.so` files are added (eight files total). The other 4,479 regular
+files match the fresh official archive byte-for-byte, including all unchanged
+input/window/graphics/media components and their official measured PGO output.
+Do not overwrite the official or another installed runner.
+
+The eight modules and regression PEs were freshly compiled in dedicated
+traditional x64/i386 trees using the pinned TKG configure functions, stable
+optimization flags, tests enabled and ccache disabled, in an isolated Ubuntu24.04
+dependency environment. Full Valve ancestry was recovered before these builds:
+shallow history can incorrectly select TKG's legacy CROSS flag fallback.
+No PGO training/gating is claimed for the two changed module owners. Public NSI
+layouts and interface signatures remain unchanged; the strict IPv6 table ID is
+private and the unchanged NLM interfaces now have an embedded/registerable typelib.
+All 61 netprofm and 39 nsiproxy PE import symbols per architecture exist in the
+official runtime, and original netprofm exports are retained. All four Unix
+libraries resolve against the same-architecture official ntdll without missing
+symbols or symbol-version errors. Executed overlay tests additionally validate
+the paired Unix-call ABI and apartment dispatch; matching source pins alone is
+not the compatibility proof.
+
+The separate full reference x64 build completed with an earlier shallow-history
+legacy CROSS flag fallback. Its modules are not delivered. The following isolated
+i386 development-package switch failed in package-state backup handling; full
+reference i386 build/install did not complete. This is not a clean full release
+rebuild or a full reference-build pass. Partial-module configurations' missing
+optional unrelated development dependencies do not strip any feature from the
+official runtime retained by the overlay. The dependency environment is not a
+pinned OCI image: retain package-version and apt-source manifests with private
+build evidence, and do not substitute new-WoW64 for traditional split i386.
+
+### Executed complete-overlay runtime checks
+
+Every regression PE ran through the complete official runner with the eight-file
+overlay, explicitly selected loader/server/DLL paths and disposable prefixes;
+partial build-tree loaders were not used for runtime closure. Both architectures
+passed the following, with zero failures:
+
+| Check | x64 / i386 assertions per architecture | Skips |
+| --- | --- | --- |
+| Ordinary NLM | 87 | 0 |
+| Ordinary NSI | 1,751 | 0 |
+| Ordinary IPHelper | 1,070 | 1 each: global IPv6 unreachable |
+| Dynamic topology, carrier, default/on-link/IPv6 routes and STA callbacks | 200 | 0 |
+| Snapshot/dynamic topology policies | 110 + 110 + 103 + 103 | 0 |
+| Strict IPv6 unavailable versus empty | 110 + 111 | 0 |
+| Monitor faults / malformed-authenticated D-Bus | 826 + 110; 254 D-Bus fixture checks | 0 |
+| NSI device / fatal, retained and control interleavings | 1,000 + 148 + 148 + 148 + 149 | 0 |
+| Passive fake-NM startup, owner loss and reconnect / STA dispatch | 136 | 0 |
+
+Inherited Wine todos remain visible, not converted to passes. Separate no-D-Bus
+Unix builds (SONAME definition absent) passed all four snapshot/dynamic topology
+policy cases on both architectures; those test-only libraries are not delivered.
+Namespace topology and passive fake-NM fixtures do not prove physical network
+outage/suspend or whole-Wine device-host/system-bus recovery.
+
+Workstation Bottles, upgraded-prefix typelib registration, real GUI/input and
+application checks remain separate pending QA. An existing prefix with no NLM
+typelib needs registration checked explicitly; a clean-prefix pass is insufficient.
+ARM64 compilation/runtime, authenticated application login, application scrolling
+and application media playback are not claimed. Keep graphics ABI overrides out
+of the global Bottles/Python environment and preserve existing user data/settings.
 
 ## Reproduce focused checks
 
 Follow the **11.0-10** workflow's pinned fetch/import/TKG preparation sequence,
 including its original stable patches plus the NLM patch. Generate Valve Vulkan,
 server/request/spec outputs and configure files as the pinned TKG recipe does.
-Configure/build both traditional Unix architectures with tests enabled, then run:
+Configure/build both traditional Unix architectures with tests enabled. For a
+complete build tree, run:
 
 ```sh
 bash .github/check-netprofm.sh /absolute/WINE_SOURCE /absolute/WINE_BUILD /absolute/NEW_LOG_DIR
