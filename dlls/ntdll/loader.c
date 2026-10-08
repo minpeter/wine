@@ -1156,7 +1156,7 @@ static int use_lsteamclient(void)
 
     if (use != -1) return use;
 
-    use = !get_env( L"PROTON_DISABLE_LSTEAMCLIENT", env, sizeof(env) ) || *env == '0';
+    use = get_env( L"PROTON_DISABLE_LSTEAMCLIENT", env, sizeof(env) ) && *env == '0';
     if (!use)
         ERR("lsteamclient disabled.\n");
     return use;

@@ -2002,7 +2002,7 @@ int CDECL _gcvt_s(char *buff, size_t size, double number, int digits)
  * VERSION
  *	[i386] Windows binary compatible - returns the struct in eax/edx.
  */
-#ifdef __i386__
+#if defined(__i386__) && !defined(__WINE_PE_BUILD)
 unsigned __int64 CDECL div(int num, int denom)
 {
     union {
@@ -2017,8 +2017,6 @@ unsigned __int64 CDECL div(int num, int denom)
 #else
 /*********************************************************************
  *		div (MSVCRT.@)
- * VERSION
- *	[!i386] Non-x86 can't run win32 apps so we don't need binary compatibility
  */
 div_t CDECL div(int num, int denom)
 {
@@ -2036,7 +2034,7 @@ div_t CDECL div(int num, int denom)
  * VERSION
  * 	[i386] Windows binary compatible - returns the struct in eax/edx.
  */
-#ifdef __i386__
+#if defined(__i386__) && !defined(__WINE_PE_BUILD)
 unsigned __int64 CDECL ldiv(__msvcrt_long num, __msvcrt_long denom)
 {
     union {
@@ -2051,8 +2049,6 @@ unsigned __int64 CDECL ldiv(__msvcrt_long num, __msvcrt_long denom)
 #else
 /*********************************************************************
  *		ldiv (MSVCRT.@)
- * VERSION
- *	[!i386] Non-x86 can't run win32 apps so we don't need binary compatibility
  */
 ldiv_t CDECL ldiv(__msvcrt_long num, __msvcrt_long denom)
 {

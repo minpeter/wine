@@ -57,10 +57,6 @@ static HRESULT WINAPI uisettings_QueryInterface( IUISettings *iface, REFIID iid,
     {
         *out = &impl->IUISettings_iface;
     }
-    else if (IsEqualGUID( iid, &IID_IUISettings2 ))
-    {
-        *out = &impl->IUISettings2_iface;
-    }
     else if (IsEqualGUID( iid, &IID_IUISettings3 ))
     {
         *out = &impl->IUISettings3_iface;

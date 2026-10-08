@@ -17,14 +17,53 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include "winsock2.h"
+#include "ws2ipdef.h"
 #include "windows.h"
 #define COBJMACROS
 #include "initguid.h"
+#include "iphlpapi.h"
+#include "iptypes.h"
+#include "netioapi.h"
+#define __WINE_INIT_NPI_MODULEID
+#include "netiodef.h"
 #include "objbase.h"
 #include "ocidl.h"
 #include "olectl.h"
 #include "netlistmgr.h"
+#include "wine/nsi.h"
 #include "wine/test.h"
+#include "../netprofm_private.h"
+
+struct dynamic_sink
+{
+    INetworkListManagerEvents INetworkListManagerEvents_iface;
+    LONG refs;
+    INetworkListManager *mgr;
+    IConnectionPoint *connection_point;
+    DWORD cookie;
+    DWORD apartment_tid;
+    LONG callback_count;
+    LONG callback_mismatch;
+    LONG callback_thread_mismatch;
+    NLM_CONNECTIVITY callback_connectivity;
+    BOOL unadvise_on_callback;
+    BOOL teardown_on_callback;
+    HRESULT unadvise_hr;
+};
+
+static void test_route_fallback( void )
+{
+    ok( !ipv6_has_internet( TRUE, DEFAULT_ROUTE_ABSENT ),
+        "global IPv6 address without a route reported Internet connectivity\n" );
+    ok( ipv6_has_internet( TRUE, DEFAULT_ROUTE_PRESENT ),
+        "global IPv6 address with a route did not report Internet connectivity\n" );
+    ok( ipv6_has_internet( TRUE, DEFAULT_ROUTE_UNAVAILABLE ),
+        "unavailable route enumeration did not preserve the IPv6 fallback\n" );
+    ok( !ipv6_has_internet( FALSE, DEFAULT_ROUTE_UNAVAILABLE ),
+        "unavailable route enumeration reported Internet without a global IPv6 address\n" );
+}
 
 static void test_INetwork( INetwork *network, INetworkConnection *conn )
 {
@@ -234,18 +273,8 @@ static ULONG WINAPI NetworkListManagerEvents_Release(INetworkListManagerEvents *
 static HRESULT WINAPI NetworkListManagerEvents_ConnectivityChanged(INetworkListManagerEvents *iface,
         NLM_CONNECTIVITY newConnectivity)
 {
-    ok(0, "unexpected call\n");
-    return E_NOTIMPL;
+    return S_OK;
 }
-
-static const INetworkListManagerEventsVtbl mgr_sink_vtbl = {
-    NetworkListManagerEvents_QueryInterface,
-    NetworkListManagerEvents_AddRef,
-    NetworkListManagerEvents_Release,
-    NetworkListManagerEvents_ConnectivityChanged
-};
-
-static INetworkListManagerEvents mgr_sink = { &mgr_sink_vtbl };
 
 static const INetworkListManagerEventsVtbl mgr_sink_unk_vtbl = {
     Unknown_QueryInterface,
@@ -256,10 +285,88 @@ static const INetworkListManagerEventsVtbl mgr_sink_unk_vtbl = {
 
 static INetworkListManagerEvents mgr_sink_unk = { &mgr_sink_unk_vtbl };
 
+static struct dynamic_sink *impl_from_dynamic_sink( INetworkListManagerEvents *iface )
+{
+    return CONTAINING_RECORD( iface, struct dynamic_sink, INetworkListManagerEvents_iface );
+}
+
+static HRESULT WINAPI dynamic_sink_QueryInterface( INetworkListManagerEvents *iface, REFIID iid, void **out )
+{
+    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_INetworkListManagerEvents ))
+    {
+        *out = iface;
+        INetworkListManagerEvents_AddRef( iface );
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI dynamic_sink_AddRef( INetworkListManagerEvents *iface )
+{
+    return InterlockedIncrement( &impl_from_dynamic_sink( iface )->refs );
+}
+
+static ULONG WINAPI dynamic_sink_Release( INetworkListManagerEvents *iface )
+{
+    return InterlockedDecrement( &impl_from_dynamic_sink( iface )->refs );
+}
+
+static HRESULT WINAPI dynamic_sink_ConnectivityChanged( INetworkListManagerEvents *iface,
+                                                        NLM_CONNECTIVITY connectivity )
+{
+    struct dynamic_sink *sink = impl_from_dynamic_sink( iface );
+    APTTYPEQUALIFIER qualifier;
+    NLM_CONNECTIVITY current;
+    APTTYPE type;
+
+    sink->callback_connectivity = connectivity;
+    InterlockedIncrement( &sink->callback_count );
+    if (GetCurrentThreadId() != sink->apartment_tid || FAILED(CoGetApartmentType( &type, &qualifier )) ||
+        (type != APTTYPE_STA && type != APTTYPE_MAINSTA))
+        InterlockedIncrement( &sink->callback_thread_mismatch );
+    if (FAILED(INetworkListManager_GetConnectivity( sink->mgr, &current )) || current != connectivity)
+        InterlockedIncrement( &sink->callback_mismatch );
+    if (sink->unadvise_on_callback && sink->cookie)
+    {
+        sink->unadvise_hr = IConnectionPoint_Unadvise( sink->connection_point, sink->cookie );
+        sink->cookie = 0;
+    }
+    if (sink->teardown_on_callback)
+    {
+        IConnectionPoint_Release( sink->connection_point );
+        sink->connection_point = NULL;
+        INetworkListManager_Release( sink->mgr );
+        sink->mgr = NULL;
+    }
+    return S_OK;
+}
+
+static const INetworkListManagerEventsVtbl dynamic_sink_vtbl =
+{
+    dynamic_sink_QueryInterface,
+    dynamic_sink_AddRef,
+    dynamic_sink_Release,
+    dynamic_sink_ConnectivityChanged,
+};
+
+static void init_dynamic_sink( struct dynamic_sink *sink, INetworkListManager *mgr,
+                               IConnectionPoint *connection_point )
+{
+    memset( sink, 0, sizeof(*sink) );
+    sink->INetworkListManagerEvents_iface.lpVtbl = &dynamic_sink_vtbl;
+    sink->refs = 1;
+    sink->mgr = mgr;
+    sink->connection_point = connection_point;
+    sink->apartment_tid = GetCurrentThreadId();
+    sink->unadvise_hr = E_UNEXPECTED;
+}
+
 static void test_INetworkListManager( void )
 {
+    struct dynamic_sink sink;
     IConnectionPointContainer *cpc, *cpc2;
-    INetworkListManager *mgr;
+    INetworkListManager *mgr, *second_mgr;
     INetworkCostManager *cost_mgr;
     NLM_CONNECTIVITY connectivity;
     VARIANT_BOOL connected;
@@ -351,14 +458,24 @@ static void test_INetworkListManager( void )
     hr = IConnectionPoint_Advise( pt, (IUnknown*)&mgr_sink_unk, &cookie);
     ok( hr == CONNECT_E_CANNOTCONNECT, "Advise failed: %08lx\n", hr );
 
-    hr = IConnectionPoint_Advise( pt, (IUnknown*)&mgr_sink, &cookie);
+    init_dynamic_sink( &sink, mgr, pt );
+    hr = IConnectionPoint_Advise( pt, (IUnknown *)&sink.INetworkListManagerEvents_iface, &cookie );
     ok( hr == S_OK, "Advise failed: %08lx\n", hr );
+    ok( sink.refs > 1, "expected marshaled sink reference, got %ld\n", sink.refs );
 
     hr = IConnectionPoint_Unadvise( pt, 0xdeadbeef );
     ok( hr == OLE_E_NOCONNECTION || hr == CONNECT_E_NOCONNECTION, "Unadvise failed: %08lx\n", hr );
 
     hr = IConnectionPoint_Unadvise( pt, cookie );
     ok( hr == S_OK, "Unadvise failed: %08lx\n", hr );
+    ok( sink.refs == 1, "expected sink reference release, got %ld\n", sink.refs );
+
+    second_mgr = NULL;
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&second_mgr );
+    ok( hr == S_OK, "failed to create concurrent manager, hr %#lx\n", hr );
+    ok( second_mgr != mgr, "expected independent manager instances\n" );
+    if (second_mgr) INetworkListManager_Release( second_mgr );
 
     hr = IConnectionPointContainer_FindConnectionPoint( cpc, &IID_INetworkListManagerEvents, &pt2 );
     ok( hr == S_OK, "got %08lx\n", hr );
@@ -460,9 +577,670 @@ static void test_INetworkListManager( void )
     ok( !ref1, "ref = %lu\n", ref1 );
 }
 
+static void write_marker( const char *dir, const char *name )
+{
+    char path[MAX_PATH];
+    HANDLE file;
+
+    snprintf( path, sizeof(path), "%s\\%s", dir, name );
+    file = CreateFileA( path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, 0, NULL );
+    ok( file != INVALID_HANDLE_VALUE, "failed to create marker %s, error %lu\n", path, GetLastError() );
+    if (file != INVALID_HANDLE_VALUE) CloseHandle( file );
+}
+
+static void pump_messages( DWORD timeout )
+{
+    MSG msg;
+
+    MsgWaitForMultipleObjects( 0, NULL, FALSE, timeout, QS_ALLINPUT );
+    while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE ))
+    {
+        TranslateMessage( &msg );
+        DispatchMessageW( &msg );
+    }
+}
+
+static BOOL wait_for_connectivity( INetworkListManager *mgr, NLM_CONNECTIVITY expected, BOOL equal,
+                                   NLM_CONNECTIVITY *value )
+{
+    unsigned int i;
+
+    for (i = 0; i < 200; i++)
+    {
+        if (SUCCEEDED(INetworkListManager_GetConnectivity( mgr, value )) &&
+            ((*value == expected) == equal)) return TRUE;
+        pump_messages( 50 );
+    }
+    return FALSE;
+}
+
+static BOOL wait_for_marker( const char *dir, const char *name )
+{
+    char path[MAX_PATH];
+    unsigned int i;
+
+    snprintf( path, sizeof(path), "%s\\%s", dir, name );
+    for (i = 0; i < 200; i++)
+    {
+        if (GetFileAttributesA( path ) != INVALID_FILE_ATTRIBUTES) return TRUE;
+        Sleep( 50 );
+    }
+    return FALSE;
+}
+
+static BOOL wait_for_callback_count( struct dynamic_sink *sink, LONG expected )
+{
+    unsigned int i;
+
+    for (i = 0; i < 200; i++)
+    {
+        if (sink->callback_count == expected) return TRUE;
+        pump_messages( 50 );
+    }
+    return FALSE;
+}
+
+static BOOL wait_for_sink_refs( struct dynamic_sink *sink, LONG expected )
+{
+    unsigned int i;
+
+    for (i = 0; i < 200; i++)
+    {
+        if (sink->refs == expected) return TRUE;
+        pump_messages( 50 );
+    }
+    return FALSE;
+}
+
+static IF_OPER_STATUS get_adapter_oper_status( const WCHAR *name )
+{
+    IP_ADAPTER_ADDRESSES *addresses, *address;
+    IF_OPER_STATUS status = IfOperStatusUnknown;
+    ULONG err, size = 0;
+
+    err = GetAdaptersAddresses( AF_UNSPEC, 0, NULL, NULL, &size );
+    if (err != ERROR_BUFFER_OVERFLOW) return status;
+    if (!(addresses = malloc( size ))) return status;
+    err = GetAdaptersAddresses( AF_UNSPEC, 0, NULL, addresses, &size );
+    if (!err)
+    {
+        for (address = addresses; address; address = address->Next)
+        {
+            if (wcscmp( address->FriendlyName, name )) continue;
+            status = address->OperStatus;
+            break;
+        }
+    }
+    free( addresses );
+    return status;
+}
+
+static void test_dynamic_connectivity( const char *marker_dir )
+{
+    struct dynamic_sink sink;
+    IConnectionPointContainer *container;
+    IConnectionPoint *connection_point;
+    IEnumNetworks *networks;
+    INetworkListManager *mgr;
+    INetwork *network, *same_network;
+    NLM_CONNECTIVITY initial, without_ipv4, without_ipv4_internet, without_ipv6_internet, current;
+    LONG expected_callbacks = 0;
+    NET_LUID luid;
+    GUID id;
+    DWORD cookie, err, i;
+    HRESULT hr;
+
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&mgr );
+    ok( hr == S_OK, "failed to create manager, hr %#lx\n", hr );
+    if (FAILED(hr)) return;
+
+    hr = INetworkListManager_GetConnectivity( mgr, &initial );
+    ok( hr == S_OK, "initial GetConnectivity failed, hr %#lx\n", hr );
+    ok( !(initial & NLM_CONNECTIVITY_IPV6_INTERNET),
+        "reported IPv6 Internet without a default route, value %#x\n", initial );
+    write_marker( marker_dir, "initial_no_ipv6_route" );
+    ok( wait_for_marker( marker_dir, "initial_ipv6_route_added" ),
+        "timed out waiting for initial IPv6 route\n" );
+    INetworkListManager_Release( mgr );
+
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&mgr );
+    ok( hr == S_OK, "failed to recreate manager, hr %#lx\n", hr );
+    if (FAILED(hr)) return;
+
+    hr = INetworkListManager_GetNetworks( mgr, NLM_ENUM_NETWORK_ALL, &networks );
+    ok( hr == S_OK, "GetNetworks failed, hr %#lx\n", hr );
+    hr = IEnumNetworks_Next( networks, 1, &network, NULL );
+    ok( hr == S_OK, "expected a network, hr %#lx\n", hr );
+    IEnumNetworks_Release( networks );
+    if (hr != S_OK)
+    {
+        INetworkListManager_Release( mgr );
+        return;
+    }
+    INetwork_GetNetworkId( network, &id );
+
+    hr = INetworkListManager_QueryInterface( mgr, &IID_IConnectionPointContainer, (void **)&container );
+    ok( hr == S_OK, "QueryInterface failed, hr %#lx\n", hr );
+    hr = IConnectionPointContainer_FindConnectionPoint( container, &IID_INetworkListManagerEvents,
+                                                        &connection_point );
+    ok( hr == S_OK, "FindConnectionPoint failed, hr %#lx\n", hr );
+    IConnectionPointContainer_Release( container );
+
+    init_dynamic_sink( &sink, mgr, connection_point );
+    hr = IConnectionPoint_Advise( connection_point,
+                                  (IUnknown *)&sink.INetworkListManagerEvents_iface, &cookie );
+    ok( hr == S_OK, "Advise failed, hr %#lx\n", hr );
+    sink.cookie = cookie;
+
+    hr = INetworkListManager_GetConnectivity( mgr, &initial );
+    ok( hr == S_OK && initial != NLM_CONNECTIVITY_DISCONNECTED,
+        "expected initial connectivity, hr %#lx, value %#x\n", hr, initial );
+    ok( initial & NLM_CONNECTIVITY_IPV6_INTERNET,
+        "expected initial IPv6 Internet connectivity, value %#x\n", initial );
+    write_marker( marker_dir, "ready" );
+
+    without_ipv4_internet = initial & ~NLM_CONNECTIVITY_IPV4_INTERNET;
+    without_ipv4_internet |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
+    ok( wait_for_connectivity( mgr, without_ipv4_internet, TRUE, &current ),
+        "IPv4 default route removal did not remove IPv4 Internet connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "IPv4 route-removal callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "route_removed" );
+
+    ok( wait_for_marker( marker_dir, "ipv4_unusable_route_added" ),
+        "timed out waiting for unusable IPv4 route\n" );
+    pump_messages( 500 );
+    hr = INetworkListManager_GetConnectivity( mgr, &current );
+    ok( hr == S_OK && current == without_ipv4_internet,
+        "unusable IPv4 route changed connectivity, hr %#lx, value %#x\n", hr, current );
+    ok( sink.callback_count == expected_callbacks,
+        "unusable IPv4 route produced a callback, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv4_unusable_route_checked" );
+
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "on-link IPv4 default route did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "on-link IPv4 route callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "route_onlink_restored" );
+    ok( wait_for_connectivity( mgr, without_ipv4_internet, TRUE, &current ),
+        "on-link IPv4 default removal did not remove Internet connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "on-link IPv4 route-removal callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "route_onlink_removed" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "gateway IPv4 route restoration did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "gateway IPv4 route callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "route_restored" );
+
+    without_ipv6_internet = initial & ~NLM_CONNECTIVITY_IPV6_INTERNET;
+    without_ipv6_internet |= NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
+    ok( wait_for_connectivity( mgr, without_ipv6_internet, TRUE, &current ),
+        "IPv6 route removal did not remove IPv6 Internet connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "IPv6 route-removal callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv6_route_removed" );
+
+    ok( wait_for_marker( marker_dir, "ipv6_unusable_route_added" ),
+        "timed out waiting for unusable IPv6 route\n" );
+    pump_messages( 500 );
+    hr = INetworkListManager_GetConnectivity( mgr, &current );
+    ok( hr == S_OK && current == without_ipv6_internet,
+        "unusable IPv6 route changed connectivity, hr %#lx, value %#x\n", hr, current );
+    ok( sink.callback_count == expected_callbacks,
+        "unusable IPv6 route produced a callback, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv6_unusable_route_checked" );
+
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "on-link IPv6 default route did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "on-link IPv6 route callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv6_route_onlink_restored" );
+    ok( wait_for_connectivity( mgr, without_ipv6_internet, TRUE, &current ),
+        "on-link IPv6 default removal did not remove Internet connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "on-link IPv6 route-removal callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv6_route_onlink_removed" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "gateway IPv6 route restoration did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "gateway IPv6 route callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "ipv6_route_restored" );
+
+    without_ipv4 = initial & ~(NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV4_INTERNET);
+    ok( wait_for_connectivity( mgr, without_ipv4, TRUE, &current ),
+        "address removal did not remove IPv4 connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "address-removal callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "address_removed" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "address restoration did not restore connectivity, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "address-restoration callback was not delivered, count %ld\n", sink.callback_count );
+    write_marker( marker_dir, "address_restored" );
+
+    ok( wait_for_connectivity( mgr, NLM_CONNECTIVITY_DISCONNECTED, TRUE, &current ),
+        "carrier loss did not disconnect, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "carrier-loss callback was not delivered, count %ld\n", sink.callback_count );
+    ok( sink.callback_connectivity == NLM_CONNECTIVITY_DISCONNECTED,
+        "carrier-loss callback reported %#x\n", sink.callback_connectivity );
+    ok( get_adapter_oper_status( L"nlm0" ) == IfOperStatusLowerLayerDown,
+        "carrier loss did not report lower-layer-down operational status\n" );
+    sink.unadvise_on_callback = TRUE;
+    write_marker( marker_dir, "carrier_down" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ), "connectivity did not recover, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, ++expected_callbacks ),
+        "carrier-restoration callback was not delivered, count %ld\n", sink.callback_count );
+    ok( current == initial, "connectivity changed from %#x to %#x\n", initial, current );
+    ok( get_adapter_oper_status( L"nlm0" ) == IfOperStatusUp,
+        "carrier restoration did not report operational status up\n" );
+
+    same_network = NULL;
+    hr = INetworkListManager_GetNetwork( mgr, id, &same_network );
+    ok( hr == S_OK, "GetNetwork failed, hr %#lx\n", hr );
+    ok( same_network == network, "network identity changed, %p != %p\n", same_network, network );
+    if (same_network) INetwork_Release( same_network );
+
+    ok( sink.callback_count == expected_callbacks, "expected %ld callbacks, got %ld\n",
+        expected_callbacks, sink.callback_count );
+    ok( !sink.callback_mismatch, "callback reentrant GetConnectivity mismatched %ld times\n",
+        sink.callback_mismatch );
+    ok( !sink.callback_thread_mismatch, "callback ran outside the advising STA %ld times\n",
+        sink.callback_thread_mismatch );
+    ok( sink.callback_connectivity != NLM_CONNECTIVITY_DISCONNECTED,
+        "recovery callback reported disconnected connectivity\n" );
+    ok( sink.unadvise_hr == S_OK && !sink.cookie,
+        "reentrant Unadvise failed, hr %#lx, cookie %lu\n", sink.unadvise_hr, sink.cookie );
+
+    /* A newly discovered adapter must use the same route policy as the
+     * initial snapshot and the existing networks refreshed above. */
+    write_marker( marker_dir, "add_adapter" );
+    ok( wait_for_marker( marker_dir, "adapter_added" ), "new adapter setup timed out\n" );
+    err = ConvertInterfaceAliasToLuid( L"nlm2", &luid );
+    ok( !err, "new adapter lookup failed, error %lu\n", err );
+    if (!err)
+    {
+        err = ConvertInterfaceLuidToGuid( &luid, &id );
+        ok( !err, "new adapter GUID lookup failed, error %lu\n", err );
+        same_network = NULL;
+        for (i = 0; i < 200; i++)
+        {
+            if (!same_network) INetworkListManager_GetNetwork( mgr, id, &same_network );
+            if (same_network && SUCCEEDED(INetwork_GetConnectivity( same_network, &current )) &&
+                current == (NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV6_LOCALNETWORK)) break;
+            pump_messages( 50 );
+        }
+        ok( i < 200, "new adapter did not acquire local-only connectivity, value %#x\n", current );
+        if (same_network) INetwork_Release( same_network );
+    }
+
+    IConnectionPoint_Release( connection_point );
+    INetwork_Release( network );
+    INetworkListManager_Release( mgr );
+    ok( wait_for_sink_refs( &sink, 1 ), "sink references were not released, refs %ld\n", sink.refs );
+    ok( INetworkListManagerEvents_Release( &sink.INetworkListManagerEvents_iface ) == 0,
+        "sink still referenced after teardown\n" );
+}
+
+static void test_reachability( const char *marker_dir )
+{
+    struct dynamic_sink sink;
+    IConnectionPointContainer *container;
+    IConnectionPoint *connection_point;
+    INetworkListManager *mgr, *second_mgr;
+    NLM_CONNECTIVITY initial, local, current;
+    char activation_marker[MAX_PATH];
+    DWORD cookie;
+    HRESULT hr;
+
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&mgr );
+    ok( hr == S_OK, "failed to create manager, hr %#lx\n", hr );
+    if (FAILED(hr)) return;
+
+    hr = INetworkListManager_GetConnectivity( mgr, &initial );
+    ok( hr == S_OK, "GetConnectivity failed, hr %#lx\n", hr );
+    ok( initial & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET),
+        "expected initial Internet connectivity, got %#x\n", initial );
+    /* Exercise indeterminate-state retries as well as the initial GetAll. */
+    Sleep( 2200 );
+    hr = INetworkListManager_GetConnectivity( mgr, &current );
+    ok( hr == S_OK && current == initial, "stopped service changed connectivity to %#x\n", current );
+    snprintf( activation_marker, sizeof(activation_marker), "%s/activated", marker_dir );
+    ok( GetFileAttributesA( activation_marker ) == INVALID_FILE_ATTRIBUTES,
+        "NLM activated the stopped NetworkManager service\n" );
+    write_marker( marker_dir, "passive" );
+    ok( wait_for_marker( marker_dir, "service-ready" ), "explicit service startup timed out\n" );
+    local = initial;
+    if (local & NLM_CONNECTIVITY_IPV4_INTERNET)
+    {
+        local &= ~NLM_CONNECTIVITY_IPV4_INTERNET;
+        local |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
+    }
+    if (local & NLM_CONNECTIVITY_IPV6_INTERNET)
+    {
+        local &= ~NLM_CONNECTIVITY_IPV6_INTERNET;
+        local |= NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
+    }
+
+    second_mgr = NULL;
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&second_mgr );
+    ok( hr == S_OK, "failed to create second manager, hr %#lx\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        hr = INetworkListManager_GetConnectivity( second_mgr, &current );
+        ok( hr == S_OK && current == initial,
+            "second manager has wrong initial connectivity, hr %#lx, value %#x\n", hr, current );
+    }
+
+    hr = INetworkListManager_QueryInterface( mgr, &IID_IConnectionPointContainer, (void **)&container );
+    ok( hr == S_OK, "QueryInterface failed, hr %#lx\n", hr );
+    hr = IConnectionPointContainer_FindConnectionPoint( container, &IID_INetworkListManagerEvents,
+                                                        &connection_point );
+    ok( hr == S_OK, "FindConnectionPoint failed, hr %#lx\n", hr );
+    IConnectionPointContainer_Release( container );
+
+    init_dynamic_sink( &sink, mgr, connection_point );
+    hr = IConnectionPoint_Advise( connection_point,
+                                  (IUnknown *)&sink.INetworkListManagerEvents_iface, &cookie );
+    ok( hr == S_OK, "Advise failed, hr %#lx\n", hr );
+    sink.cookie = cookie;
+    write_marker( marker_dir, "ready" );
+
+    ok( wait_for_connectivity( mgr, local, TRUE, &current ),
+        "LIMITED did not suppress Internet connectivity, value %#x\n", current );
+    if (second_mgr)
+        ok( wait_for_connectivity( second_mgr, local, TRUE, &current ),
+            "second manager did not observe LIMITED, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, 1 ), "LIMITED callback was not delivered, count %ld\n",
+        sink.callback_count );
+    write_marker( marker_dir, "limited" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "UNKNOWN did not restore topology fallback, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, 2 ), "UNKNOWN callback was not delivered, count %ld\n",
+        sink.callback_count );
+    write_marker( marker_dir, "unknown" );
+
+    ok( wait_for_marker( marker_dir, "disabled" ), "timed out waiting for disabled state\n" );
+    pump_messages( 500 );
+    hr = INetworkListManager_GetConnectivity( mgr, &current );
+    ok( hr == S_OK && current == initial,
+        "disabled connectivity check changed fallback, hr %#lx, value %#x\n", hr, current );
+    ok( sink.callback_count == 2, "disabled connectivity check produced a callback, count %ld\n",
+        sink.callback_count );
+    write_marker( marker_dir, "disabled_checked" );
+
+    ok( wait_for_connectivity( mgr, local, TRUE, &current ),
+        "probe-backed NONE did not suppress Internet connectivity, value %#x\n", current );
+    write_marker( marker_dir, "enabled" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "service loss did not restore topology fallback, value %#x\n", current );
+    write_marker( marker_dir, "stopped" );
+    ok( wait_for_connectivity( mgr, local, TRUE, &current ),
+        "restarted PORTAL service did not suppress Internet connectivity, value %#x\n", current );
+    write_marker( marker_dir, "restarted" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "FULL did not restore Internet connectivity, value %#x\n", current );
+    write_marker( marker_dir, "full" );
+
+    ok( wait_for_connectivity( mgr, local, TRUE, &current ),
+        "PORTAL before bus loss did not suppress Internet connectivity, value %#x\n", current );
+    write_marker( marker_dir, "bus_portal" );
+    ok( wait_for_connectivity( mgr, initial, TRUE, &current ),
+        "bus loss did not restore topology fallback, value %#x\n", current );
+    write_marker( marker_dir, "bus_stopped" );
+    ok( wait_for_connectivity( mgr, local, TRUE, &current ),
+        "bus and service restart did not restore passive reachability, value %#x\n", current );
+    ok( wait_for_callback_count( &sink, 9 ), "bus-restart callback was not delivered, count %ld\n",
+        sink.callback_count );
+    sink.unadvise_on_callback = sink.teardown_on_callback = TRUE;
+    write_marker( marker_dir, "bus_restarted" );
+
+    ok( wait_for_callback_count( &sink, 10 ), "expected ten callbacks, got %ld\n", sink.callback_count );
+    ok( !sink.callback_mismatch, "callback reentrant GetConnectivity mismatched %ld times\n",
+        sink.callback_mismatch );
+    ok( !sink.callback_thread_mismatch, "callback ran outside the advising STA %ld times\n",
+        sink.callback_thread_mismatch );
+    ok( sink.callback_connectivity == initial, "last callback %#x, expected %#x\n",
+        sink.callback_connectivity, initial );
+    ok( sink.unadvise_hr == S_OK && !sink.cookie,
+        "reentrant Unadvise failed, hr %#lx, cookie %lu\n", sink.unadvise_hr, sink.cookie );
+    ok( !sink.mgr && !sink.connection_point, "callback did not tear down the manager\n" );
+
+    if (second_mgr)
+    {
+        ok( wait_for_connectivity( second_mgr, initial, TRUE, &current ),
+            "second manager did not follow final FULL transition, value %#x\n", current );
+        INetworkListManager_Release( second_mgr );
+    }
+    if (sink.cookie) IConnectionPoint_Unadvise( connection_point, sink.cookie );
+    if (sink.connection_point) IConnectionPoint_Release( sink.connection_point );
+    if (sink.mgr) INetworkListManager_Release( sink.mgr );
+    ok( wait_for_sink_refs( &sink, 1 ), "sink references were not released, refs %ld\n", sink.refs );
+    ok( INetworkListManagerEvents_Release( &sink.INetworkListManagerEvents_iface ) == 0,
+        "sink still referenced after teardown\n" );
+
+    second_mgr = NULL;
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&second_mgr );
+    ok( hr == S_OK, "failed to recreate manager after teardown, hr %#lx\n", hr );
+    if (second_mgr)
+    {
+        INetworkListManager_Release( second_mgr );
+    }
+}
+
+static void test_ipv6_route_availability( BOOL unavailable )
+{
+    static const ULONG families[] = {AF_UNSPEC, AF_INET6};
+    const ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_DNS_SERVER;
+    IP_ADAPTER_ADDRESSES *addresses, *adapter;
+    IP_ADAPTER_UNICAST_ADDRESS *address;
+    struct nsi_ipv6_forward_key *keys;
+    MIB_IPFORWARD_TABLE2 *routes;
+    INetworkListManager *mgr;
+    NLM_CONNECTIVITY connectivity, expected;
+    BOOL found, ipv4, ipv6;
+    DWORD count, err;
+    ULONG size, i, j;
+    HRESULT hr;
+
+    trace( "IPv6 route source %s\n", unavailable ? "unavailable" : "empty" );
+    count = 0;
+    err = NsiEnumerateObjectsAllParameters( 1, 0, &NPI_MS_IPV6_MODULEID,
+                                            NSI_WINE_IPV6_FORWARD_TABLE_STRICT,
+                                            NULL, 0, NULL, 0, NULL, 0, NULL, 0, &count );
+    ok( err == (unavailable ? ERROR_NOT_SUPPORTED : ERROR_SUCCESS),
+        "strict enumeration returned %lu\n", err );
+    if (!err) ok( !count, "strict enumeration returned %lu rows\n", count );
+
+    count = 0;
+    err = NsiEnumerateObjectsAllParameters( 1, 0, &NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE,
+                                            NULL, 0, NULL, 0, NULL, 0, NULL, 0, &count );
+    ok( !err && !count, "public count query returned %lu, count %lu\n", err, count );
+    err = NsiAllocateAndGetTable( 1, &NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE,
+                                  (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
+    ok( !err, "public enumeration returned %lu\n", err );
+    if (!err)
+    {
+        ok( !count, "public enumeration returned %lu rows\n", count );
+        NsiFreeTable( keys, NULL, NULL, NULL );
+    }
+
+    for (i = 0; i < ARRAY_SIZE(families); i++)
+    {
+        winetest_push_context( "family %lu", families[i] );
+        size = 0;
+        err = GetAdaptersAddresses( families[i], flags, NULL, NULL, &size );
+        ok( err == ERROR_BUFFER_OVERFLOW && size, "adapter sizing returned %lu, size %lu\n", err, size );
+        if (err == ERROR_BUFFER_OVERFLOW && (addresses = malloc( size )))
+        {
+            err = GetAdaptersAddresses( families[i], flags, NULL, addresses, &size );
+            ok( !err, "adapter enumeration returned %lu\n", err );
+            if (!err)
+            {
+                found = ipv4 = ipv6 = FALSE;
+                for (adapter = addresses; adapter; adapter = adapter->Next)
+                {
+                    if (wcscmp( adapter->FriendlyName, L"nlm0" )) continue;
+                    found = TRUE;
+                    for (address = adapter->FirstUnicastAddress; address; address = address->Next)
+                    {
+                        if (address->Address.lpSockaddr->sa_family == AF_INET) ipv4 = TRUE;
+                        if (address->Address.lpSockaddr->sa_family == AF_INET6)
+                        {
+                            const struct sockaddr_in6 *addr = (const struct sockaddr_in6 *)address->Address.lpSockaddr;
+                            if (addr->sin6_addr.s6_addr[0] == 0x20 && addr->sin6_addr.s6_addr[1] == 0x01)
+                                ipv6 = TRUE;
+                        }
+                    }
+                }
+                ok( found, "nlm0 missing from adapters\n" );
+                ok( ipv4 == (families[i] == AF_UNSPEC), "unexpected IPv4 address presence %d\n", ipv4 );
+                ok( ipv6, "global IPv6 address missing\n" );
+            }
+            free( addresses );
+        }
+
+        err = GetIpForwardTable2( families[i], &routes );
+        ok( !err, "GetIpForwardTable2 returned %lu\n", err );
+        if (!err)
+        {
+            ipv4 = ipv6 = FALSE;
+            for (j = 0; j < routes->NumEntries; j++)
+            {
+                if (routes->Table[j].DestinationPrefix.Prefix.si_family == AF_INET6) ipv6 = TRUE;
+                if (routes->Table[j].DestinationPrefix.Prefix.si_family == AF_INET &&
+                    !routes->Table[j].DestinationPrefix.PrefixLength) ipv4 = TRUE;
+            }
+            ok( !ipv6, "unexpected IPv6 routes\n" );
+            ok( ipv4 == (families[i] == AF_UNSPEC), "unexpected IPv4 default route presence %d\n", ipv4 );
+            FreeMibTable( routes );
+        }
+        winetest_pop_context();
+    }
+
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&mgr );
+    ok( hr == S_OK, "failed to create manager, hr %#lx\n", hr );
+    if (FAILED(hr)) return;
+    connectivity = NLM_CONNECTIVITY_DISCONNECTED;
+    expected = NLM_CONNECTIVITY_IPV4_INTERNET |
+               (unavailable ? NLM_CONNECTIVITY_IPV6_INTERNET : NLM_CONNECTIVITY_IPV6_LOCALNETWORK);
+    hr = INetworkListManager_GetConnectivity( mgr, &connectivity );
+    ok( hr == S_OK, "GetConnectivity failed, hr %#lx\n", hr );
+    ok( connectivity == expected, "connectivity %#x, expected %#x\n", connectivity, expected );
+    INetworkListManager_Release( mgr );
+}
+
+static void test_topology_policy( const char *policy )
+{
+    const BOOL snapshot = !strncmp( policy, "snapshot", 8 ), down = !!strstr( policy, "down" );
+    IP_ADAPTER_ADDRESSES *addresses, *adapter;
+    IP_ADAPTER_UNICAST_ADDRESS *address;
+    MIB_IPFORWARD_TABLE2 *routes;
+    INetworkListManager *mgr;
+    IEnumNetworkConnections *connections;
+    INetworkConnection *connection;
+    INetwork *network;
+    NLM_CONNECTIVITY expected, connectivity;
+    BOOL found = FALSE, ipv4 = FALSE, ipv6 = FALSE;
+    ULONG size = 0, i;
+    DWORD err;
+    HRESULT hr;
+
+    trace( "topology policy %s\n", policy );
+    err = GetAdaptersAddresses( AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_DNS_SERVER,
+                                NULL, NULL, &size );
+    ok( err == ERROR_BUFFER_OVERFLOW, "adapter sizing returned %lu\n", err );
+    if (err != ERROR_BUFFER_OVERFLOW) return;
+    addresses = malloc( size );
+    err = GetAdaptersAddresses( AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_DNS_SERVER,
+                                NULL, addresses, &size );
+    ok( !err, "adapter enumeration returned %lu\n", err );
+    if (!err) for (adapter = addresses; adapter; adapter = adapter->Next)
+    {
+        if (wcscmp( adapter->FriendlyName, L"nlm0" )) continue;
+        found = TRUE;
+        ok( (adapter->OperStatus == IfOperStatusUp) == !down, "unexpected status %u\n", adapter->OperStatus );
+        ok( !!adapter->FirstGatewayAddress == !down, "unexpected gateway presence\n" );
+        for (address = adapter->FirstUnicastAddress; address; address = address->Next)
+        {
+            if (address->Address.lpSockaddr->sa_family == AF_INET) ipv4 = TRUE;
+            if (address->Address.lpSockaddr->sa_family == AF_INET6) ipv6 = TRUE;
+        }
+    }
+    ok( found && ipv4 && ipv6, "missing adapter or retained addresses: %d/%d/%d\n", found, ipv4, ipv6 );
+    free( addresses );
+    err = GetIpForwardTable2( AF_UNSPEC, &routes );
+    ok( !err, "route enumeration returned %lu\n", err );
+    if (!err)
+    {
+        for (i = 0; i < routes->NumEntries; i++)
+            ok( routes->Table[i].DestinationPrefix.PrefixLength, "unexpected default route\n" );
+        FreeMibTable( routes );
+    }
+
+    /* The namespace has global IPv6 but no IPv6 default. Its IPv4 gateway is
+     * only for a specific route and disappears when the adapter is down. */
+    if (snapshot) expected = NLM_CONNECTIVITY_IPV6_INTERNET |
+                             (down ? NLM_CONNECTIVITY_IPV4_LOCALNETWORK : NLM_CONNECTIVITY_IPV4_INTERNET);
+    else expected = down ? NLM_CONNECTIVITY_DISCONNECTED :
+                          NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
+    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_INetworkListManager, (void **)&mgr );
+    ok( hr == S_OK, "failed to create manager, hr %#lx\n", hr );
+    if (FAILED(hr)) return;
+    hr = INetworkListManager_GetConnectivity( mgr, &connectivity );
+    ok( hr == S_OK && connectivity == expected, "manager connectivity %#x, expected %#x, hr %#lx\n",
+        connectivity, expected, hr );
+    hr = INetworkListManager_GetNetworkConnections( mgr, &connections );
+    ok( hr == S_OK, "GetNetworkConnections returned %#lx\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        hr = IEnumNetworkConnections_Next( connections, 1, &connection, NULL );
+        ok( hr == S_OK, "missing connection, hr %#lx\n", hr );
+        if (hr == S_OK)
+        {
+            hr = INetworkConnection_GetConnectivity( connection, &connectivity );
+            ok( hr == S_OK && connectivity == expected, "connection connectivity %#x, expected %#x\n",
+                connectivity, expected );
+            hr = INetworkConnection_GetNetwork( connection, &network );
+            ok( hr == S_OK, "GetNetwork returned %#lx\n", hr );
+            if (SUCCEEDED(hr))
+            {
+                hr = INetwork_GetConnectivity( network, &connectivity );
+                ok( hr == S_OK && connectivity == expected, "network connectivity %#x, expected %#x\n",
+                    connectivity, expected );
+                INetwork_Release( network );
+            }
+            INetworkConnection_Release( connection );
+        }
+        IEnumNetworkConnections_Release( connections );
+    }
+    INetworkListManager_Release( mgr );
+}
+
 START_TEST( list )
 {
+    char dynamic_dir[MAX_PATH] = {0}, reachability_dir[MAX_PATH] = {0}, ipv6_routes[32] = {0};
+    char topology_policy[32] = {0};
+
+    GetEnvironmentVariableA( "WINETEST_NETPROFM_DYNAMIC_DIR", dynamic_dir, ARRAY_SIZE(dynamic_dir) );
+    GetEnvironmentVariableA( "WINETEST_NETPROFM_REACHABILITY_DIR", reachability_dir,
+                             ARRAY_SIZE(reachability_dir) );
+    GetEnvironmentVariableA( "WINETEST_NETPROFM_IPV6_ROUTES", ipv6_routes, ARRAY_SIZE(ipv6_routes) );
+    GetEnvironmentVariableA( "WINETEST_NETPROFM_TOPOLOGY_POLICY", topology_policy, ARRAY_SIZE(topology_policy) );
     CoInitialize( NULL );
+    test_route_fallback();
     test_INetworkListManager();
+    if (dynamic_dir[0]) test_dynamic_connectivity( dynamic_dir );
+    if (reachability_dir[0]) test_reachability( reachability_dir );
+    if (ipv6_routes[0]) test_ipv6_route_availability( !strcmp( ipv6_routes, "unavailable" ) );
+    if (topology_policy[0]) test_topology_policy( topology_policy );
     CoUninitialize();
 }

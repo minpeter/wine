@@ -107,6 +107,11 @@ struct nsi_ndis_ifinfo_static
 #define NSI_IP_NEIGHBOUR_TABLE            11
 #define NSI_IP_FORWARD_TABLE              16
 
+/* Wine-only IPv6 forward enumeration which reports an unavailable backend.
+ * The public table preserves successful empty results for compatibility.
+ * Change notifications still use NSI_IP_FORWARD_TABLE. */
+#define NSI_WINE_IPV6_FORWARD_TABLE_STRICT 0x10000
+
 struct nsi_ip_cmpt_rw
 {
     UINT not_forwarding;

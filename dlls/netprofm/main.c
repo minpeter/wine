@@ -25,6 +25,7 @@
 #include "netlistmgr.h"
 
 #include "wine/debug.h"
+#include "wine/unixlib.h"
 #include "netprofm_private.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(netprofm);
@@ -99,6 +100,16 @@ static const struct IClassFactoryVtbl netprofm_cf_vtbl =
 };
 
 static struct netprofm_cf list_manager_cf = { { &netprofm_cf_vtbl }, list_manager_create };
+
+BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
+{
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        DisableThreadLibraryCalls( instance );
+        __wine_init_unix_call();
+    }
+    return TRUE;
+}
 
 /***********************************************************************
  *      DllGetClassObject (NETPROFM.@)

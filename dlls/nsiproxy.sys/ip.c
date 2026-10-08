@@ -1558,6 +1558,7 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void 
             entry.prefix.s_addr = strtoul( ptr, &ptr, 16 );
             entry.next_hop.s_addr = strtoul( ptr + 1, &ptr, 16 );
             rtf_flags = strtoul( ptr + 1, &ptr, 16 );
+            if (!(rtf_flags & RTF_UP) || (rtf_flags & RTF_REJECT)) continue;
             strtoul( ptr + 1, &ptr, 16 ); /* refcount, skip */
             strtoul( ptr + 1, &ptr, 16 ); /* use, skip */
             entry.metric = strtoul( ptr + 1, &ptr, 16 );
@@ -1783,9 +1784,9 @@ struct in6_addr str_to_in6_addr(char *nptr, char **endptr)
     return ret;
 }
 
-static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void *rw_data, UINT rw_size,
-                                            void *dynamic_data, UINT dynamic_size,
-                                            void *static_data, UINT static_size, UINT_PTR *count )
+static NTSTATUS ipv6_forward_enumerate_all_strict( void *key_data, UINT key_size, void *rw_data, UINT rw_size,
+                                                   void *dynamic_data, UINT dynamic_size,
+                                                   void *static_data, UINT static_size, UINT_PTR *count )
 {
     UINT num = 0;
     NTSTATUS status = STATUS_SUCCESS;
@@ -1804,7 +1805,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void 
         if (!(fp = fopen( "/proc/net/ipv6_route", "r" )))
         {
             *count = 0;
-            return STATUS_SUCCESS;
+            return STATUS_NOT_SUPPORTED;
         }
 
         while ((ptr = fgets( buf, sizeof(buf), fp )))
@@ -1818,7 +1819,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void 
             strtoul( ptr + 1, &ptr, 16 ); /* refcount, skip */
             strtoul( ptr + 1, &ptr, 16 ); /* use, skip */
             rtf_flags = strtoul( ptr + 1, &ptr, 16);
-            if (!(rtf_flags & RTF_UP)) continue;
+            if (!(rtf_flags & RTF_UP) || (rtf_flags & RTF_REJECT)) continue;
             entry.protocol = (rtf_flags & RTF_GATEWAY) ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
             entry.loopback = entry.prefix_len == 128 && IN6_IS_ADDR_LOOPBACK(&entry.prefix);
 
@@ -1844,12 +1845,29 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void 
 #else
     FIXME( "not implemented\n" );
     *count = 0;
-    return STATUS_SUCCESS;
+    return STATUS_NOT_IMPLEMENTED;
 #endif
 
     if (!want_data || num <= *count) *count = num;
     else status = STATUS_BUFFER_OVERFLOW;
 
+    return status;
+}
+
+static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void *rw_data, UINT rw_size,
+                                            void *dynamic_data, UINT dynamic_size,
+                                            void *static_data, UINT static_size, UINT_PTR *count )
+{
+    NTSTATUS status;
+
+    status = ipv6_forward_enumerate_all_strict( key_data, key_size, rw_data, rw_size,
+                                               dynamic_data, dynamic_size, static_data, static_size, count );
+    /* IP Helper relies on successful empty enumeration on unsupported hosts. */
+    if (status == STATUS_NOT_SUPPORTED || status == STATUS_NOT_IMPLEMENTED)
+    {
+        *count = 0;
+        return STATUS_SUCCESS;
+    }
     return status;
 }
 
@@ -1989,6 +2007,14 @@ static struct module_table ipv6_tables[] =
             sizeof(struct nsi_ipv6_forward_dynamic), sizeof(struct nsi_ip_forward_static)
         },
         ipv6_forward_enumerate_all,
+    },
+    {
+        NSI_WINE_IPV6_FORWARD_TABLE_STRICT,
+        {
+            sizeof(struct nsi_ipv6_forward_key), sizeof(struct nsi_ip_forward_rw),
+            sizeof(struct nsi_ipv6_forward_dynamic), sizeof(struct nsi_ip_forward_static)
+        },
+        ipv6_forward_enumerate_all_strict,
     },
     {
         ~0u

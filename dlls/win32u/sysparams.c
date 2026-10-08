@@ -4276,6 +4276,22 @@ static BOOL source_get_full_mode( const struct source *source, const DEVMODEW *d
         TRACE( "Return to original display mode\n" );
     }
 
+    if (!is_detached_mode( full_mode ) &&
+        (full_mode->dmFields & (DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT)) == DM_BITSPERPEL)
+    {
+        DEVMODEW current_mode = {.dmSize = sizeof(DEVMODEW)};
+
+        if (!source_get_current_settings( source, &current_mode )) return FALSE;
+        full_mode->dmPelsWidth = current_mode.dmPelsWidth;
+        full_mode->dmPelsHeight = current_mode.dmPelsHeight;
+        full_mode->dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;
+        if (!(full_mode->dmFields & DM_POSITION))
+        {
+            full_mode->dmPosition = current_mode.dmPosition;
+            full_mode->dmFields |= DM_POSITION;
+        }
+    }
+
     if ((full_mode->dmFields & (DM_PELSWIDTH | DM_PELSHEIGHT)) != (DM_PELSWIDTH | DM_PELSHEIGHT))
     {
         WARN( "devmode doesn't specify the resolution: %#x\n", full_mode->dmFields );
