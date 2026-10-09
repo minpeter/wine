@@ -10,8 +10,8 @@ Existing copyright/LGPL notices and prerequisite attribution to Hans Leidekker
 and Paul Gofman are retained. The patch extends the reviewed
 `minpeter/wine:port/soda-11.0-10-nlm` payload with strict IPv6 stream-error
 handling, bounded Linux reachability setup, complete netlink datagram reception
-and regression coverage. Its SHA256 is
-`f5f021d08efc949ef5c6424cfad6ff53c356150ca8b99b7ebc43d0ffe37a2f2a`.
+and listener-startup regression coverage. Its SHA256 is
+`61df4c95520ef8f989f5fcef1e5224370f3fdb8ca6d52c870f9961f85f161d04`.
 It has not been accepted upstream.
 
 ## Behavior
@@ -20,6 +20,9 @@ It has not been accepted upstream.
   Adapter carrier and usable default routes determine topology connectivity.
   The Linux monitor sizes each netlink datagram before receiving it, growing
   its buffer when necessary instead of losing notifications above 4,096 bytes.
+  The driver initializes the kernel listener before publishing its device, so
+  subscription readiness also guarantees that initial changes are captured.
+  Initialization failure rejects monitoring without removing enumeration/ICMP.
 - An optional passive NetworkManager provider can downgrade Internet status.
   It does not activate NetworkManager or initiate connectivity probes.
   Unavailable D-Bus falls back to topology, not automatic disconnection.
@@ -130,6 +133,44 @@ After isolated QA, a controlled application restart verified the selected
 candidate's actual loader, NLM and updated NSI mappings and a mapped compositor
 window. Only runner selection changed; the preceding runner and stopped-prefix
 backup remain available. No account content or workstation paths are published.
+
+The subsequent listener-startup review reproduced a smaller-route race on the
+actual 11.0-28 x64 runtime: subscriptions and snapshot reconciliation could
+complete before the detached worker bound the multicast socket. Adding a route
+during that gap left cached LOCAL connectivity stale until another event. The
+fix binds synchronously before publishing the device and latches initialization
+failure. The internal dispatch table gains an eighth initialization entry;
+the original seven positions and all parameter layouts are unchanged. Both PE
+and Unix halves must be replaced together, not as a Unix-only overlay.
+
+Both architectures were rebuilt without warnings in the corrected paired
+configurations. The separate complete 11.0-28 candidate replaces exactly four
+production files: both `nsiproxy.sys` and `nsiproxy.so` pairs. All other 4,551
+regular files and 16 symlinks match the preceding runner. Delivered standalone
+fixtures pass on both architectures: device interleavings (1,005), socket/bind
+failures (34 each), receive/retained errors (148 each), control (149), and both
+kernel multipath boundaries (25 each). During each five-second startup bind
+gate, the launcher remains alive and the factory does not finish early. Both
+unchanged LOCAL topology and a default added during the gate initialize
+correctly after binding (five assertions each), without a later wake event.
+Ordinary tests (87/1,807/1,111), native Bottles topology/NM (200/136), and the
+unchanged direct-Wine IPv6 source script (110/111/110/110) pass on both
+architectures, with zero failures/skips and inherited TODOs retained.
+
+Initial supplemental stable x64 runs failed before assertions at the startup
+launcher and the IPv6 empty-mode launcher. Their logs remain unsuppressed.
+Focused unchanged-source Unix-path and Windows-path startup contrasts pass;
+the path hypothesis is not confirmed, and the initial causes remain unproven.
+No fixture, assertion or production implementation was changed for those
+diagnostic comparisons. Current28 checks above are composed-runtime execution,
+not a full compile-and-run wrapper execution in the partial module build trees.
+
+After current28 QA, the workstation selected the separately installed candidate.
+A controlled application restart verified its actual loader, NLM PE/Unix and
+paired NSI driver PE/Unix mappings, and a mapped, non-hidden application window.
+Only the runner setting changed; the preceding runner and protected stopped
+prefix backup remain available. No authenticated function or whole-system
+reboot/suspend acceptance is claimed.
 
 These are composed-runtime checks, **not a fresh full current patch-stack or
 dual-architecture PGO release-build pass**. Full current-stack compilation and
