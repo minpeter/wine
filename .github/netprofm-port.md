@@ -157,10 +157,20 @@ Ordinary tests (87/1,807/1,111), native Bottles topology/NM (200/136), and the
 unchanged direct-Wine IPv6 source script (110/111/110/110) pass on both
 architectures, with zero failures/skips and inherited TODOs retained.
 
+The independent complete stable 11.0-10 reference also passes ordinary tests
+and all seven fixture scripts on both architectures. Genuine rebuilt prior
+PE/Unix pairs publish the manager early in both gated startup modes; adding
+the default during the gate also leaves stale LOCAL connectivity. The unchanged
+full x64 fault-script trace rerun holds the gate for over five seconds and then
+observes listener readiness before creation, passing both startup modes.
+
 Initial supplemental stable x64 runs failed before assertions at the startup
 launcher and the IPv6 empty-mode launcher. Their logs remain unsuppressed.
 Focused unchanged-source Unix-path and Windows-path startup contrasts pass;
 the path hypothesis is not confirmed, and the initial causes remain unproven.
+A separate traced IPv6 diagnostic used a mismatched older test PE and was
+rejected as production evidence; the unchanged script with the matching PE
+passes all four modes. No failing assertions were suppressed.
 No fixture, assertion or production implementation was changed for those
 diagnostic comparisons. Current28 checks above are composed-runtime execution,
 not a full compile-and-run wrapper execution in the partial module build trees.
