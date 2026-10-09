@@ -95,13 +95,15 @@ if [[ -f $build_dir/dlls/netprofm/tests/i386-windows/netprofm_test.exe &&
     cleanup_dynamic_prefix
 fi
 if grep -q '^#define SONAME_LIBDBUS_1 ' "$build_dir/include/config.h"; then
-    if "$source_dir/dlls/netprofm/tests/reachability-network.sh" "$build_dir" \
-        >"$logs/reachability-network.log" 2>&1; then
-        echo 'PASS: reachability-network'
-    else
-        echo "FAIL: reachability-network (see $logs/reachability-network.log)"
-        status=1
-    fi
+    for test in reachability-network bus-stalls; do
+        if sh "$source_dir/dlls/netprofm/tests/$test.sh" "$build_dir" \
+            >"$logs/$test.log" 2>&1; then
+            echo "PASS: $test"
+        else
+            echo "FAIL: $test (see $logs/$test.log)"
+            status=1
+        fi
+    done
 fi
 if [[ $status == 0 ]]; then echo 'All selected NLM/NSI/IP Helper checks passed.'; fi
 exit "$status"

@@ -9,8 +9,8 @@ AI-assisted implementation and port using Amp, authored by Woonggi Min.
 Existing copyright/LGPL notices and prerequisite attribution to Hans Leidekker
 and Paul Gofman are retained. The patch extends the reviewed
 `minpeter/wine:port/soda-11.0-10-nlm` payload with strict IPv6 stream-error
-handling and regression coverage. Its SHA256 is
-`c4ead8734afaf27279a6fe8214ae3907f9e85f1ac0ec9a3fb7f3d0e1db09bb29`.
+handling, bounded Linux reachability setup and regression coverage. Its SHA256 is
+`ac985d6d500250592b1328b264c27f1970f0db8179d11f0d4047e9714fa25b75`.
 It has not been accepted upstream.
 
 ## Behavior
@@ -20,6 +20,12 @@ It has not been accepted upstream.
 - An optional passive NetworkManager provider can downgrade Internet status.
   It does not activate NetworkManager or initiate connectivity probes.
   Unavailable D-Bus falls back to topology, not automatic disconnection.
+  Linux loads `libsystemd.so.0` at runtime for nonblocking sd-bus transport;
+  no systemd SDK or required link dependency is added. The existing D-Bus
+  configure switch still disables the provider. Missing runtime symbols,
+  unsupported non-Unix address overrides and timeout all retain topology.
+  Each provider invocation has a one-second monotonic budget covering
+  authentication, Hello, match registration and queries; teardown never flushes.
 - COM event sinks use apartment-safe GIT dispatch. Startup reconciles state
   after all subscriptions are armed; backend failure completes pending/future
   requests and downgrades monitoring rather than stranding subscriptions.
@@ -65,6 +71,16 @@ reproduced two real read-error assertion failures on both architectures.
 A controlled workstation restart verified the application's new runner/NLM
 mappings, the updated NSI driver module, and a visible application window;
 graphics, sync, environment and DLL overrides were preserved.
+
+The subsequent bounded-bus change was compiled in both corrected paired-module
+configurations, including the compile-time no-provider branches. A separate
+native execution of the actual provider exercised silent AUTH, a saturated
+accept queue, and stalled Hello/AddMatch/GetNameOwner/GetAll: initial/reconnect
+invocations returned within approximately one second and teardown returned
+immediately. Adapted malformed-message checks use the real sd-bus encoder and
+reader. Final composed-runtime/COM regression and workstation replacement
+results for this change are pending; the preceding runtime results do not
+establish those results.
 
 These are composed-runtime checks, **not a fresh full current patch-stack or
 dual-architecture PGO release-build pass**. Full current-stack compilation and

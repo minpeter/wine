@@ -1,12 +1,13 @@
-From 74faa23286056655a5e06c0bdba374f2f637af73 Mon Sep 17 00:00:00 2001
+From c73500c5822b62208207793932961e1e95ac866d Mon Sep 17 00:00:00 2001
 From: Woonggi Min <62207008+minpeter@users.noreply.github.com>
-Date: Fri, 9 Oct 2026 16:38:54 +0900
+Date: Fri, 9 Oct 2026 19:00:58 +0900
 Subject: [PATCH] netprofm: Port reviewed dynamic connectivity and fault
  regressions to Soda.
 
 AI-assisted implementation and port using Amp, reviewed series 455e3509b98a6919fd4ad1def4803e08c41c03b2..b82c41eca5ffd18a198afe008d2dc9f6fc53d453.
 Includes prerequisite IPv6 and loopback work by Hans Leidekker and Paul Gofman. Retains Valve prefer-native and ICMP behavior.
 Fixtures honor CC for split-i386 Unix helpers and select only built PE architectures. Strict IPv6 stream errors preserve the NLM fallback without changing public partial/empty enumeration.
+Linux optional reachability uses runtime-loaded sd-bus with bounded nonblocking setup/queries and topology fallback. Public COM regressions cover stalled authentication, full accept queues, method replies, and provider recovery.
 
 Co-authored-by: Amp <amp@ampcode.com>
 Amp-Thread-ID: https://ampcode.com/threads/T-01a0fc5f-d85f-778a-8561-d4ea9af67f80
@@ -17,8 +18,11 @@ Amp-Thread-ID: https://ampcode.com/threads/T-01a0fc5f-d85f-778a-8561-d4ea9af67f8
  dlls/netprofm/netprofm.idl                    |   2 +-
  dlls/netprofm/netprofm_private.h              |  14 +-
  dlls/netprofm/tests/Makefile.in               |   2 +-
- dlls/netprofm/tests/adversarial.sh            | 105 +++
- dlls/netprofm/tests/dbus-malformed.c          | 304 +++++++
+ dlls/netprofm/tests/adversarial.sh            | 111 +++
+ dlls/netprofm/tests/bus-stalls.c              | 111 +++
+ dlls/netprofm/tests/bus-stalls.py             | 248 ++++++
+ dlls/netprofm/tests/bus-stalls.sh             |  92 ++
+ dlls/netprofm/tests/dbus-malformed.c          | 339 +++++++
  dlls/netprofm/tests/dynamic-network.sh        | 138 +++
  dlls/netprofm/tests/fake-networkmanager.py    |  72 ++
  .../netprofm/tests/ipv6-route-availability.sh |  84 ++
@@ -32,7 +36,7 @@ Amp-Thread-ID: https://ampcode.com/threads/T-01a0fc5f-d85f-778a-8561-d4ea9af67f8
  dlls/netprofm/tests/reachability-network.sh   | 274 ++++++
  dlls/netprofm/tests/topology-backend.c        |  58 ++
  dlls/netprofm/tests/topology-policy.sh        |  83 ++
- dlls/netprofm/unixlib.c                       | 520 +++++++++++
+ dlls/netprofm/unixlib.c                       | 535 +++++++++++
  dlls/netprofm/unixlib.h                       |  66 ++
  dlls/nsiproxy.sys/device.c                    |  43 +-
  dlls/nsiproxy.sys/ip.c                        |  46 +-
@@ -40,8 +44,11 @@ Amp-Thread-ID: https://ampcode.com/threads/T-01a0fc5f-d85f-778a-8561-d4ea9af67f8
  dlls/nsiproxy.sys/nsi.c                       |  27 +-
  include/netlistmgr.idl                        |  10 +
  include/wine/nsi.h                            |   5 +
- 29 files changed, 4539 insertions(+), 139 deletions(-)
+ 32 files changed, 5046 insertions(+), 139 deletions(-)
  create mode 100755 dlls/netprofm/tests/adversarial.sh
+ create mode 100644 dlls/netprofm/tests/bus-stalls.c
+ create mode 100644 dlls/netprofm/tests/bus-stalls.py
+ create mode 100644 dlls/netprofm/tests/bus-stalls.sh
  create mode 100644 dlls/netprofm/tests/dbus-malformed.c
  create mode 100755 dlls/netprofm/tests/dynamic-network.sh
  create mode 100755 dlls/netprofm/tests/fake-networkmanager.py
@@ -1443,10 +1450,10 @@ index 3dd8aed..b618aa2 100644
  	list.c
 diff --git a/dlls/netprofm/tests/adversarial.sh b/dlls/netprofm/tests/adversarial.sh
 new file mode 100755
-index 0000000..a89e758
+index 0000000..88b9d88
 --- /dev/null
 +++ b/dlls/netprofm/tests/adversarial.sh
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,111 @@
 +#!/bin/sh
 +set -eu
 +
@@ -1503,8 +1510,10 @@ index 0000000..a89e758
 +    dbus=true
 +    ${CC:-cc} -shared -fPIC -Wall -Wl,-z,defs -D__WINESRC__ -DWINE_UNIX_LIB \
 +        -I"$build_dir/include" -I"$root/include" -I"$source_dir/.." \
-+        $(pkg-config --cflags dbus-1) -o "$work_dir/dbus.so" "$source_dir/dbus-malformed.c" \
-+        "$build_dir/dlls/ntdll/ntdll.so" $(pkg-config --libs dbus-1) -lpthread
++        -o "$work_dir/dbus.so" "$source_dir/dbus-malformed.c" \
++        "$build_dir/dlls/ntdll/ntdll.so" -ldl -lpthread
++else
++    echo "D-Bus adversarial fixture: SKIP provider disabled in this build"
 +fi
 +
 +arches=x86_64
@@ -1548,25 +1557,497 @@ index 0000000..a89e758
 +            "$build_dir/wine" "$test_exe" list >"$work_dir/test.log" 2>&1 || result=$?
 +        cat "$work_dir/test.log"
 +        [ "$result" -eq 0 ] || exit "$result"
-+        grep -q 'D-Bus adversarial fixture: .* checks passed' "$work_dir/test.log"
++        if grep -q 'D-Bus adversarial fixture: SKIP optional libsystemd unavailable' "$work_dir/test.log"; then
++            echo "D-Bus adversarial: $arch SKIP (optional libsystemd unavailable)"
++        else
++            grep -q 'D-Bus adversarial fixture: .* checks passed' "$work_dir/test.log"
++        fi
 +        run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w
 +    fi
 +done
+diff --git a/dlls/netprofm/tests/bus-stalls.c b/dlls/netprofm/tests/bus-stalls.c
+new file mode 100644
+index 0000000..899c8c2
+--- /dev/null
++++ b/dlls/netprofm/tests/bus-stalls.c
+@@ -0,0 +1,111 @@
++/* Public COM optional-bus deadlines. Copyright 2026 Peter Min
++ * SPDX-License-Identifier: LGPL-2.1-or-later */
++#define COBJMACROS
++#define STANDALONE
++#include <stdarg.h>
++#include <stdio.h>
++#include "windef.h"
++#include "winbase.h"
++#include "objbase.h"
++#include "initguid.h"
++#include "netlistmgr.h"
++#include "wine/test.h"
++
++/* Exported by kernel32, but not yet declared by this Wine header revision. */
++BOOL WINAPI GetProcessHandleCount(HANDLE process, DWORD *count);
++
++static char directory[MAX_PATH];
++
++static BOOL marker(const char *name, BOOL create)
++{
++    char path[MAX_PATH];
++    HANDLE file;
++    snprintf(path, sizeof(path), "%s\\%s", directory, name);
++    if (!create) return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
++    file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
++    ok(file != INVALID_HANDLE_VALUE, "marker %s failed\n", name);
++    if (file == INVALID_HANDLE_VALUE) return FALSE;
++    CloseHandle(file);
++    return TRUE;
++}
++
++static void bounded(const char *operation, ULONGLONG start)
++{
++    ULONGLONG elapsed = GetTickCount64() - start;
++    trace("%s: %I64u ms\n", operation, elapsed);
++    ok(elapsed < 3000, "%s exceeded 3s: %I64u ms\n", operation, elapsed);
++}
++
++static NLM_CONNECTIVITY connectivity(INetworkListManager *manager)
++{
++    NLM_CONNECTIVITY value = 0;
++    ULONGLONG start = GetTickCount64();
++    HRESULT hr = INetworkListManager_GetConnectivity(manager, &value);
++    bounded("GetConnectivity", start);
++    ok(hr == S_OK, "GetConnectivity: %#lx\n", hr);
++    return value;
++}
++
++static BOOL wait_state(INetworkListManager *manager, BOOL online)
++{
++    ULONGLONG deadline = GetTickCount64() + 20000;
++    do
++    {
++        NLM_CONNECTIVITY value = connectivity(manager);
++        if (online ? !!(value & NLM_CONNECTIVITY_IPV4_INTERNET) :
++            !!(value & NLM_CONNECTIVITY_IPV4_LOCALNETWORK) && !(value & NLM_CONNECTIVITY_IPV4_INTERNET))
++            return TRUE;
++        Sleep(100);
++    } while (GetTickCount64() < deadline);
++    ok(0, "provider did not become %s\n", online ? "ONLINE" : "OFFLINE");
++    return FALSE;
++}
++
++START_TEST(bus_stalls)
++{
++    INetworkListManager *manager;
++    ULONGLONG start, deadline;
++    HRESULT hr;
++    DWORD before = 0, after = 0;
++    unsigned int i;
++    BOOL recovery = GetEnvironmentVariableA("NLM_RECOVERY", NULL, 0) != 0;
++    if (!GetEnvironmentVariableA("NLM_MARKERS", directory, sizeof(directory)))
++    {
++        ok(0, "run via bus-stalls.sh\n");
++        return;
++    }
++    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    ok(SUCCEEDED(hr), "CoInitializeEx: %#lx\n", hr);
++    for (i = 0; i < (recovery ? 1 : 8); i++)
++    {
++        start = GetTickCount64();
++        hr = CoCreateInstance(&CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
++                             &IID_INetworkListManager, (void **)&manager);
++        bounded("CoCreateInstance", start);
++        ok(hr == S_OK, "CoCreateInstance: %#lx\n", hr);
++        if (FAILED(hr)) break;
++        if (!recovery)
++            ok(connectivity(manager) & NLM_CONNECTIVITY_IPV4_INTERNET,
++               "unavailable provider did not retain routed topology\n");
++        if (recovery && wait_state(manager, FALSE))
++        {
++            marker("offline", TRUE);
++            if (wait_state(manager, TRUE))
++            {
++                marker("online", TRUE);
++                deadline = GetTickCount64() + 20000;
++                while (!marker("release", FALSE) && GetTickCount64() < deadline) Sleep(10);
++                ok(marker("release", FALSE), "no stalled reconnect release gate\n");
++            }
++        }
++        start = GetTickCount64();
++        INetworkListManager_Release(manager);
++        bounded("Release", start);
++        if (!i) ok(GetProcessHandleCount(GetCurrentProcess(), &before), "initial handle count failed\n");
++    }
++    ok(GetProcessHandleCount(GetCurrentProcess(), &after), "final handle count failed\n");
++    /* After warming COM once, permit lazy runtime handles but not one leaked
++     * event per subsequent failure. */
++    ok(after <= before + 6, "handles grew from %lu to %lu\n", before, after);
++    CoUninitialize();
++}
+diff --git a/dlls/netprofm/tests/bus-stalls.py b/dlls/netprofm/tests/bus-stalls.py
+new file mode 100644
+index 0000000..9c78f71
+--- /dev/null
++++ b/dlls/netprofm/tests/bus-stalls.py
+@@ -0,0 +1,248 @@
++#!/usr/bin/python3
++"""Public COM deadlines with real auth/method targets and NM recovery.
++
++A private daemon supplies real replies; the relay withholds one method.
++"""
++import os
++from pathlib import Path
++import select
++import socket
++import struct
++import subprocess
++import sys
++import threading
++import time
++
++
++def wait_for(predicate, label, timeout=25):
++    end = time.monotonic() + timeout
++    while time.monotonic() < end:
++        if predicate():
++            return
++        time.sleep(.01)
++    raise RuntimeError("deadline waiting for " + label)
++
++
++class Peer:
++    def __init__(self, path, phase, upstream=None):
++        self.phase = phase
++        self.upstream = upstream
++        self.seen = threading.Event()
++        self.errors = []
++        self.clients = []
++        self.sock = socket.socket(socket.AF_UNIX)
++        self.sock.bind(str(path))
++        self.sock.listen(1)
++        if phase == "backlog":
++            # Linux backlog=1 admits two; prove EAGAIN rather than assuming
++            # listen(0) or an unresponsive accepted peer fills the queue.
++            for _ in range(16):
++                client = socket.socket(socket.AF_UNIX)
++                client.setblocking(False)
++                self.clients.append(client)
++                try:
++                    client.connect(str(path))
++                except BlockingIOError:
++                    self.seen.set()
++                    break
++            if not self.seen.is_set():
++                raise RuntimeError("could not saturate accept queue")
++        else:
++            threading.Thread(target=self.accept, daemon=True).start()
++
++    def accept(self):
++        while True:
++            try:
++                client, _ = self.sock.accept()
++                self.clients.append(client)
++                threading.Thread(target=self.exchange, args=(client,), daemon=True).start()
++            except OSError:
++                return
++
++    def exchange(self, client):
++        try:
++            if self.upstream:
++                self.relay(client)
++                return
++            client.settimeout(10)
++            stream = client.makefile("rb", buffering=0)
++            line = stream.readline(4096)
++            if not line.startswith(b"\0AUTH"):
++                raise RuntimeError("expected initial AUTH, got " + repr(line))
++            if self.phase == "auth":
++                self.seen.set()  # Do not answer or close until test has exited.
++                return
++            client.sendall(b"DATA\r\n" if line.strip() == b"\0AUTH EXTERNAL" else
++                           b"OK 0123456789abcdef0123456789abcdef\r\n")
++            while True:
++                line = stream.readline(4096)
++                if line == b"BEGIN\r\n":
++                    break
++                if line == b"NEGOTIATE_UNIX_FD\r\n":
++                    client.sendall(b"ERROR unsupported\r\n")
++                elif line.startswith(b"DATA"):
++                    client.sendall(b"OK 0123456789abcdef0123456789abcdef\r\n")
++                else:
++                    raise RuntimeError("unexpected auth command " + repr(line))
++            def read_exact(count):
++                data = b""
++                while len(data) < count:
++                    part = stream.read(count - len(data))
++                    if not part:
++                        raise RuntimeError("EOF before Hello")
++                    data += part
++                return data
++            header = read_exact(16)
++            if header[:4] != b"l\x01\x00\x01":
++                raise RuntimeError("unexpected D-Bus method header " + repr(header))
++            body, serial, fields = struct.unpack("<III", header[4:])
++            if fields > 4096 or body > 4096 or not serial:
++                raise RuntimeError("invalid Hello lengths")
++            message = read_exact((fields + 7) // 8 * 8 + body)
++            if b"Hello\0" not in message or b"org.freedesktop.DBus\0" not in message:
++                raise RuntimeError("first method was not Hello")
++            self.seen.set()  # Auth succeeded; deliberately never reply to Hello.
++        except Exception as exc:
++            self.errors.append(str(exc))
++
++    def relay(self, client):
++        with socket.socket(socket.AF_UNIX) as upstream:
++            upstream.connect(str(self.upstream))
++            client.settimeout(10)
++            upstream.settimeout(10)
++            stream = client.makefile("rb", buffering=0)
++            auth = upstream.makefile("rb", buffering=0)
++            while True:
++                line = stream.readline(4096)
++                if not line:
++                    return
++                upstream.sendall(line)
++                if line == b"BEGIN\r\n":
++                    break
++                response = auth.readline(4096)
++                if not response:
++                    raise RuntimeError("daemon closed during auth")
++                client.sendall(response)
++
++            def read_exact(count):
++                data = b""
++                while len(data) < count:
++                    part = stream.read(count - len(data))
++                    if not part:
++                        return None
++                    data += part
++                return data
++
++            while True:
++                ready, _, _ = select.select([client, upstream], [], [], 10)
++                if not ready:
++                    return
++                if upstream in ready:
++                    data = upstream.recv(65536)
++                    if not data:
++                        return
++                    client.sendall(data)
++                if client in ready:
++                    header = read_exact(16)
++                    if header is None:
++                        return
++                    endian = "<" if header[0] == ord("l") else ">"
++                    body, _, fields = struct.unpack(endian + "III", header[4:])
++                    if body > 1048576 or fields > 1048576:
++                        raise RuntimeError("unexpected large test message")
++                    payload = read_exact((fields + 7) // 8 * 8 + body)
++                    if payload is None:
++                        return
++                    if self.phase.encode() + b"\0" in payload[:fields]:
++                        self.seen.set()  # Withhold this genuine method request.
++                    else:
++                        upstream.sendall(header + payload)
++
++    def close(self):
++        self.sock.close()
++        for client in self.clients:
++            client.close()
++
++
++def main():
++    work, source, wine, exe = sys.argv[1:]
++    work = Path(work)
++    path = work / "bus"
++    address = "unix:path=" + str(path)
++    children = []
++    peer = None
++    try:
++        for phase in ("auth", "backlog", "hello", "AddMatch", "GetNameOwner", "GetAll", "recovery"):
++            path.unlink(missing_ok=True)
++            markers = work / phase
++            markers.mkdir()
++            env = dict(os.environ, DBUS_SYSTEM_BUS_ADDRESS=address,
++                       NLM_MARKERS="Z:" + str(markers).replace("/", "\\"))
++            if phase in ("AddMatch", "GetNameOwner", "GetAll", "recovery"):
++                upstream = work / "daemon-bus"
++                upstream.unlink(missing_ok=True)
++                daemon_address = "unix:path=" + str(upstream)
++                if phase == "recovery":
++                    env["NLM_RECOVERY"] = "1"
++                    daemon_address = address
++                config = work / "bus.conf"
++                config.write_text('<busconfig><type>session</type><listen>' + daemon_address +
++                                  '</listen><policy context="default"><allow own="*"/>'
++                                  '<allow send_destination="*"/><allow receive_sender="*"/>'
++                                  '</policy></busconfig>')
++                daemon = subprocess.Popen(["dbus-daemon", "--nofork", "--config-file=" + str(config)])
++                children.append(daemon)
++                wait_for((path if phase == "recovery" else upstream).exists, "daemon socket")
++                service = subprocess.Popen(["/usr/bin/python3", source + "/fake-networkmanager.py",
++                                            str(markers / "command"), str(markers / "ready"),
++                                            "NONE", "1", "1"],
++                                           env=dict(env, DBUS_SYSTEM_BUS_ADDRESS=daemon_address))
++                children.append(service)
++                wait_for((markers / "ready").exists, "NetworkManager")
++                if phase != "recovery":
++                    peer = Peer(path, phase, upstream)
++            else:
++                peer = Peer(path, phase)
++            print("bus stalls:", phase, flush=True)
++            test = subprocess.Popen([wine, exe], env=env)
++            children.append(test)
++            if phase == "recovery":
++                wait_for((markers / "offline").exists, "public OFFLINE")
++                (markers / "command").write_text("1 FULL 1 1\n")
++                wait_for((markers / "online").exists, "public ONLINE")
++                daemon.terminate()
++                daemon.wait(timeout=5)
++                service.terminate()
++                service.wait(timeout=5)
++                path.unlink(missing_ok=True)
++                peer = Peer(path, "auth")
++                wait_for(peer.seen.is_set, "reconnect AUTH")
++                (markers / "release").touch()
++            result = test.wait(timeout=60)
++            if result:
++                raise RuntimeError("COM test failed: " + phase)
++            if not peer.seen.is_set() or peer.errors:
++                raise RuntimeError("wire target not reached: " + repr(peer.errors))
++            print("wire target confirmed:", phase, flush=True)
++            peer.close()
++            peer = None
++            if phase in ("AddMatch", "GetNameOwner", "GetAll"):
++                service.terminate()
++                service.wait(timeout=5)
++                daemon.terminate()
++                daemon.wait(timeout=5)
++    finally:
++        if peer:
++            peer.close()
++        for child in reversed(children):
++            if child.poll() is None:
++                child.terminate()
++                try:
++                    child.wait(timeout=3)
++                except subprocess.TimeoutExpired:
++                    child.kill()
++                    child.wait()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/dlls/netprofm/tests/bus-stalls.sh b/dlls/netprofm/tests/bus-stalls.sh
+new file mode 100644
+index 0000000..a36999c
+--- /dev/null
++++ b/dlls/netprofm/tests/bus-stalls.sh
+@@ -0,0 +1,92 @@
++#!/bin/sh
++# Standalone public COM regression; no production interposition.
++set -eu
++if [ "${1-}" != --inside ]; then
++    build_dir=$(CDPATH='' cd -- "${1:?usage: sh bus-stalls.sh BUILD_DIR}" && pwd)
++    if unshare --user --map-root-user --net true 2>/dev/null; then
++        exec unshare --user --map-root-user --net sh "$0" --inside "$build_dir"
++    fi
++    if command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
++        exec sudo -E unshare --net sh "$0" --inside "$build_dir" "$(id -u)" "$(id -g)"
++    fi
++    echo 'network namespaces unavailable' >&2
++    exit 1
++fi
++build_dir=$2
++run_uid=${3-}
++run_gid=${4-}
++source_dir=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
++root=$(CDPATH='' cd -- "$source_dir/../../.." && pwd)
++work=$(mktemp -d /tmp/wine-nlm-stalls-XXXXXX)
++chmod 755 "$work"
++prefix=$work/prefix
++run_as_user()
++{
++    if [ -n "$run_uid" ]; then
++        setpriv --reuid="$run_uid" --regid="$run_gid" --init-groups \
++            env HOME="$(getent passwd "$run_uid" | cut -d: -f6)" "$@"
++    else
++        "$@"
++    fi
++}
++cleanup()
++{
++    run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -k 2>/dev/null || true
++    run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w 2>/dev/null || true
++    rm -rf "$work"
++}
++trap cleanup EXIT INT TERM
++ip link set lo up
++ip link add nlm0 type dummy
++ip addr add 192.0.2.2/24 dev nlm0
++ip link set nlm0 up
++# Routed fallback is online; NM NONE must override it in the positive control.
++ip route add default via 192.0.2.1 dev nlm0
++mkdir "$prefix"
++if [ -n "$run_uid" ]; then chown "$run_uid:$run_gid" "$prefix"; fi
++export WINEPREFIX="$prefix" WINEDEBUG=-all
++unset DISPLAY WAYLAND_DISPLAY NLM_RECOVERY
++run_as_user env DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work/missing" \
++    "$build_dir/wine" wineboot --init
++run_as_user "$build_dir/server/wineserver" -w
++run_as_user "$build_dir/server/wineserver" -p
++run_as_user env DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work/missing" \
++    "$build_dir/wine" cmd /c exit
++arches=
++for arch in x86_64 i386; do
++    if [ -f "$build_dir/dlls/netprofm/tests/$arch-windows/netprofm_test.exe" ]; then
++        arches="$arches $arch"
++    fi
++done
++classic=false
++if [ -z "$arches" ] && [ -f "$build_dir/dlls/netprofm/tests/netprofm_test.exe.so" ]; then
++    classic=true
++    case $(file "$build_dir/dlls/netprofm/tests/netprofm_test.exe.so") in
++        *32-bit*) arches=i386;;
++        *64-bit*) arches=x86_64;;
++        *) echo 'unknown classic ELF architecture' >&2; exit 1;;
++    esac
++fi
++[ -n "$arches" ] || { echo 'no built netprofm tests found' >&2; exit 1; }
++for arch in $arches; do
++    target=x86_64-w64-mingw32
++    bits=64
++    [ "$arch" != i386 ] || { target=i686-w64-mingw32; bits=32; }
++    set -- -b "$target" -D__WINE_PE_BUILD -lcompiler-rt
++    exe=$work/bus-stalls-$arch.exe
++    if "$classic"; then
++        set -- -m"$bits" -mno-cygwin -fPIC -D_WIN32 -mlong-double-64 \
++            -fno-builtin -fshort-wchar -fno-stack-protector
++        [ "$bits" != 64 ] || set -- "$@" -mabi=ms
++        exe=$exe.so
++    fi
++    "$build_dir/tools/winegcc/winegcc" --wine-objdir "$build_dir" \
++        -D__WINESRC__ -D_MSVCR_VER=0 -I"$build_dir/include" \
++        -I"$root/include" -I"$root/include/msvcrt" \
++        -o "$exe" "$source_dir/bus-stalls.c" \
++        -luuid -lole32 -lwinecrt0 "$@" -lmsvcrt -lkernel32 -lntdll
++    mkdir "$work/$arch"
++    if [ -n "$run_uid" ]; then chown "$run_uid:$run_gid" "$work/$arch"; fi
++    run_as_user /usr/bin/python3 "$source_dir/bus-stalls.py" "$work/$arch" \
++        "$source_dir" "$build_dir/wine" "$exe"
++done
 diff --git a/dlls/netprofm/tests/dbus-malformed.c b/dlls/netprofm/tests/dbus-malformed.c
 new file mode 100644
-index 0000000..1acc653
+index 0000000..8279ef8
 --- /dev/null
 +++ b/dlls/netprofm/tests/dbus-malformed.c
-@@ -0,0 +1,304 @@
-+/* Deterministic transport fixture for the real Unix provider. The message
-+ * encoder/iterators are libdbus, not mocks. Run with adversarial.sh.
-+ *
+@@ -0,0 +1,339 @@
++/* Real sd-bus wire encoder/reader, with a deterministic async transport.
 + * Copyright 2026 Peter Min
 + * SPDX-License-Identifier: LGPL-2.1-or-later
 + */
-+
 +#include <assert.h>
 +#include <stdio.h>
++#include <sys/socket.h>
++#include <unistd.h>
 +#define __wine_unix_call_funcs original_funcs
 +#define __wine_unix_call_wow64_funcs original_wow64_funcs
 +#ifndef PROVIDER_SOURCE
@@ -1576,291 +2057,327 @@ index 0000000..1acc653
 +#undef __wine_unix_call_funcs
 +#undef __wine_unix_call_wow64_funcs
 +
-+static DBusMessage *response, *signal_message;
-+static const char *current_owner = ":1.10";
-+static unsigned int getalls, checks;
-+static struct reachability_context *dispatch_context;
-+static BOOL signal_during_reply;
-+
 +#define check(expr) do { checks++; if (!(expr)) { \
-+    fprintf( stderr, "D-Bus check failed at %u: %s\n", __LINE__, #expr ); abort(); } } while (0)
++    fprintf(stderr, "sd-bus check failed at %u: %s\n", __LINE__, #expr); abort(); } } while (0)
++static unsigned int checks;
++static struct bus *encoder;
++static struct bus_message *response, *queued_signal;
++static struct reachability_context *dispatch_context;
++static bus_handler pending_handler;
++static void *pending_data;
++static const char *current_owner = ":1.10";
++static BOOL owner_reply;
 +
-+static DBusMessage *send_reply( DBusConnection *connection, DBusMessage *request, int timeout, DBusError *error )
++/* Fixture-only ABI; production keeps its minimal runtime symbol set. */
++static int (*new_bus)(struct bus **);
++static int (*set_fd)(struct bus *, int, int);
++static int (*start_bus)(struct bus *);
++static int (*new_message)(struct bus *, struct bus_message **, uint8_t);
++static int (*new_signal)(struct bus *, struct bus_message **, const char *, const char *, const char *);
++static int (*set_sender)(struct bus_message *, const char *);
++static int (*open_container)(struct bus_message *, char, const char *);
++static int (*close_container)(struct bus_message *);
++static int (*seal_message)(struct bus_message *, uint64_t, uint64_t);
++static const char *(*get_member)(struct bus_message *);
++
++static struct bus_message *seal(struct bus_message *m)
 +{
-+    DBusMessage *reply;
-+
-+    if (dbus_message_is_method_call( request, "org.freedesktop.DBus", "GetNameOwner" ))
-+    {
-+        reply = dbus_message_new( DBUS_MESSAGE_TYPE_METHOD_RETURN );
-+        assert(dbus_message_append_args( reply, DBUS_TYPE_STRING, &current_owner, DBUS_TYPE_INVALID ));
-+        return reply;
-+    }
-+    check(dbus_message_is_method_call( request, "org.freedesktop.DBus.Properties", "GetAll" ));
-+    check(!strcmp( dbus_message_get_destination( request ), current_owner ));
-+    check(!dbus_message_get_auto_start( request ));
-+    getalls++;
-+    if (signal_during_reply)
-+    {
-+        signal_during_reply = FALSE;
-+        reachability_filter( connection, signal_message, dispatch_context );
-+    }
-+    return dbus_message_ref( response );
++    check(seal_message(m, 1, 0) >= 0);
++    check(p_sd_bus_message_rewind(m, TRUE) >= 0);
++    return m;
 +}
 +
-+static dbus_bool_t dispatch( DBusConnection *connection, int timeout )
++static void property(struct bus_message *m, const char *name, char type, const void *value)
 +{
-+    if (signal_message)
-+    {
-+        reachability_filter( connection, signal_message, dispatch_context );
-+        dbus_message_unref( signal_message );
-+        signal_message = NULL;
-+    }
-+    return TRUE;
-+}
-+
-+static void property( DBusMessageIter *array, const char *name, int type, const void *value )
-+{
-+    DBusMessageIter entry, variant;
 +    char signature[] = {type, 0};
-+
-+    assert(dbus_message_iter_open_container( array, DBUS_TYPE_DICT_ENTRY, NULL, &entry ));
-+    assert(dbus_message_iter_append_basic( &entry, DBUS_TYPE_STRING, &name ));
-+    assert(dbus_message_iter_open_container( &entry, DBUS_TYPE_VARIANT, signature, &variant ));
-+    assert(dbus_message_iter_append_basic( &variant, type, value ));
-+    assert(dbus_message_iter_close_container( &entry, &variant ));
-+    assert(dbus_message_iter_close_container( array, &entry ));
++    check(open_container(m, 'e', "sv") >= 0);
++    check(p_sd_bus_message_append_basic(m, 's', name) >= 0);
++    check(open_container(m, 'v', signature) >= 0);
++    check(p_sd_bus_message_append_basic(m, type, value) >= 0);
++    check(close_container(m) >= 0);
++    check(close_container(m) >= 0);
 +}
 +
-+static DBusMessage *properties( unsigned int connectivity, unsigned int wrong, unsigned int missing )
++static struct bus_message *properties(unsigned int connectivity, unsigned int wrong,
++                                      unsigned int missing, unsigned int disabled, BOOL extra)
 +{
-+    DBusMessage *message = dbus_message_new( DBUS_MESSAGE_TYPE_METHOD_RETURN );
-+    DBusMessageIter iter, array;
-+    dbus_uint32_t value = connectivity;
-+    dbus_bool_t enabled = TRUE;
-+    const char *text = "not a number";
-+
-+    dbus_message_iter_init_append( message, &iter );
-+    assert(dbus_message_iter_open_container( &iter, DBUS_TYPE_ARRAY, "{sv}", &array ));
-+    if (!(missing & 1)) property( &array, "Connectivity", wrong & 1 ? DBUS_TYPE_STRING : DBUS_TYPE_UINT32,
-+                                 wrong & 1 ? (void *)&text : (void *)&value );
-+    if (!(missing & 2)) property( &array, "ConnectivityCheckAvailable", wrong & 2 ? DBUS_TYPE_UINT32 : DBUS_TYPE_BOOLEAN,
-+                                 wrong & 2 ? (void *)&value : (void *)&enabled );
-+    if (!(missing & 4)) property( &array, "ConnectivityCheckEnabled", wrong & 4 ? DBUS_TYPE_STRING : DBUS_TYPE_BOOLEAN,
-+                                 wrong & 4 ? (void *)&text : (void *)&enabled );
-+    if (wrong & 8) property( &array, "Connectivity", DBUS_TYPE_STRING, &text );
-+    if (wrong & 16) property( &array, "ConnectivityCheckAvailable", DBUS_TYPE_UINT32, &value );
-+    if (wrong & 32) property( &array, "ConnectivityCheckEnabled", DBUS_TYPE_STRING, &text );
-+    property( &array, "UnrelatedProperty", DBUS_TYPE_STRING, &text );
-+    assert(dbus_message_iter_close_container( &iter, &array ));
-+    return message;
++    struct bus_message *m;
++    uint32_t value = connectivity;
++    int available = !(disabled & 1), enabled = !(disabled & 2);
++    check(new_message(encoder, &m, 2) >= 0);
++    check(open_container(m, 'a', "{sv}") >= 0);
++    if (!(missing & 1)) property(m, "Connectivity", wrong & 1 ? 's' : 'u', wrong & 1 ? (void *)"bad" : &value);
++    if (!(missing & 2)) property(m, "ConnectivityCheckAvailable", wrong & 2 ? 'u' : 'b', wrong & 2 ? (void *)&value : &available);
++    if (!(missing & 4)) property(m, "ConnectivityCheckEnabled", wrong & 4 ? 's' : 'b', wrong & 4 ? (void *)"bad" : &enabled);
++    if (wrong & 8) property(m, "Connectivity", 'u', &value);
++    if (wrong & 16) property(m, "ConnectivityCheckAvailable", 'b', &available);
++    if (wrong & 32) property(m, "ConnectivityCheckEnabled", 'b', &enabled);
++    property(m, "UnrelatedProperty", 's', "ignored");
++    check(close_container(m) >= 0);
++    if (extra) check(p_sd_bus_message_append_basic(m, 's', "extra") >= 0);
++    return seal(m);
 +}
 +
-+static DBusMessage *bad_dictionary( const char *signature )
++static struct bus_message *signal_message(BOOL owner, unsigned int bad)
 +{
-+    DBusMessage *message = dbus_message_new( DBUS_MESSAGE_TYPE_METHOD_RETURN );
-+    DBusMessageIter iter, array, entry, variant;
-+    const char *text = "Connectivity";
-+    dbus_uint32_t number = 1;
-+
-+    dbus_message_iter_init_append( message, &iter );
-+    assert(dbus_message_iter_open_container( &iter, DBUS_TYPE_ARRAY, signature, &array ));
-+    assert(dbus_message_iter_open_container( &array, DBUS_TYPE_DICT_ENTRY, NULL, &entry ));
-+    assert(dbus_message_iter_append_basic( &entry, signature[1], signature[1] == 's' ? (void *)&text : (void *)&number ));
-+    if (signature[2] == 'v')
++    struct bus_message *m;
++    uint32_t number = 1;
++    check(new_signal(encoder, &m, bad == 6 ? "/foreign" : owner ? "/org/freedesktop/DBus" : "/org/freedesktop/NetworkManager",
++        bad == 7 ? "foreign.interface" : owner ? "org.freedesktop.DBus" : "org.freedesktop.DBus.Properties",
++        bad == 8 ? "ForeignSignal" : owner ? "NameOwnerChanged" : "PropertiesChanged") >= 0);
++    if (bad != 10) check(set_sender(m, bad == 9 ? ":1.99" : owner ? "org.freedesktop.DBus" : current_owner) >= 0);
++    if (bad != 2)
 +    {
-+        assert(dbus_message_iter_open_container( &entry, DBUS_TYPE_VARIANT, "u", &variant ));
-+        assert(dbus_message_iter_append_basic( &variant, DBUS_TYPE_UINT32, &number ));
-+        assert(dbus_message_iter_close_container( &entry, &variant ));
++        check(p_sd_bus_message_append_basic(m, bad == 3 ? 'u' : 's', bad == 3 ? (void *)&number :
++              bad == 11 ? "foreign.interface" : "org.freedesktop.NetworkManager") >= 0);
++        if (owner)
++        {
++            check(p_sd_bus_message_append_basic(m, 's', bad == 12 ? "invalid" : ":1.10") >= 0);
++            if (bad != 1) check(p_sd_bus_message_append_basic(m, 's', bad == 13 ? "invalid" : ":1.11") >= 0);
++        }
++        else if (bad != 1)
++        {
++            check(open_container(m, 'a', bad == 4 ? "{uv}" : "{sv}") >= 0);
++            check(close_container(m) >= 0);
++            check(open_container(m, 'a', bad == 5 ? "u" : "s") >= 0);
++            check(close_container(m) >= 0);
++        }
++        if (bad == 14) check(p_sd_bus_message_append_basic(m, 's', "extra") >= 0);
 +    }
-+    else assert(dbus_message_iter_append_basic( &entry, DBUS_TYPE_STRING, &text ));
-+    assert(dbus_message_iter_close_container( &array, &entry ));
-+    assert(dbus_message_iter_close_container( &iter, &array ));
-+    return message;
++    return seal(m);
 +}
 +
-+static DBusMessage *properties_signal( const char *sender, const char *interface, unsigned int malformed )
++static int async_reply(struct bus *bus, struct bus_slot **slot, struct bus_message *request,
++                       bus_handler handler, void *data, uint64_t timeout)
 +{
-+    DBusMessage *message = dbus_message_new_signal( "/org/freedesktop/NetworkManager",
-+                                                  "org.freedesktop.DBus.Properties", "PropertiesChanged" );
-+    DBusMessageIter iter, array;
-+    dbus_uint32_t number = 1;
++    owner_reply = !strcmp(get_member(request), "GetNameOwner");
++    pending_handler = handler;
++    pending_data = data;
++    *slot = NULL;
++    return 0;
++}
 +
-+    if (sender) assert(dbus_message_set_sender( message, sender ));
-+    if (malformed == 2) return message;
-+    dbus_message_iter_init_append( message, &iter );
-+    if (malformed == 3) assert(dbus_message_iter_append_basic( &iter, DBUS_TYPE_UINT32, &number ));
-+    else assert(dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &interface ));
-+    if (malformed != 1)
++static int process_reply(struct bus *bus, struct bus_message **unused)
++{
++    struct bus_message *m;
++    if (!pending_handler)
 +    {
-+        assert(dbus_message_iter_open_container( &iter, DBUS_TYPE_ARRAY, malformed == 4 ? "{uv}" : "{sv}", &array ));
-+        assert(dbus_message_iter_close_container( &iter, &array ));
-+        assert(dbus_message_iter_open_container( &iter, DBUS_TYPE_ARRAY, malformed == 5 ? "u" : "s", &array ));
-+        assert(dbus_message_iter_close_container( &iter, &array ));
++        if (queued_signal)
++        {
++            reachability_filter(queued_signal, dispatch_context, NULL);
++            queued_signal = p_sd_bus_message_unref(queued_signal);
++        }
++        return 1; /* deterministic dispatch until the wait budget expires */
 +    }
-+    return message;
++    if (!owner_reply && queued_signal)
++    {
++        reachability_filter(queued_signal, dispatch_context, NULL);
++        queued_signal = p_sd_bus_message_unref(queued_signal);
++    }
++    if (owner_reply)
++    {
++        check(new_message(encoder, &m, 2) >= 0);
++        check(p_sd_bus_message_append_basic(m, 's', current_owner) >= 0);
++        seal(m);
++    }
++    else m = p_sd_bus_message_ref(response);
++    pending_handler(m, pending_data, NULL);
++    pending_handler = NULL;
++    p_sd_bus_message_unref(m);
++    return 1;
 +}
 +
-+static DBusMessage *owner_signal( const char *sender, BOOL malformed )
++static void test_signal(struct reachability_context *context, BOOL owner, unsigned int bad)
 +{
-+    const char *name = "org.freedesktop.NetworkManager", *old = ":1.10", *next = ":1.11";
-+    DBusMessage *message = dbus_message_new_signal( "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameOwnerChanged" );
-+    assert(dbus_message_set_sender( message, sender ));
-+    assert(dbus_message_append_args( message, DBUS_TYPE_STRING, &name, DBUS_TYPE_STRING, &old, DBUS_TYPE_INVALID ));
-+    if (!malformed) assert(dbus_message_append_args( message, DBUS_TYPE_STRING, &next, DBUS_TYPE_INVALID ));
-+    return message;
++    struct bus_message *m = signal_message(owner, bad);
++    unsigned int generation = context->owner_generation;
++    context->refresh = FALSE;
++    reachability_filter(m, context, NULL);
++    check(context->refresh == !bad);
++    check(context->owner_generation == generation + (owner && !bad));
++    check((context->owner == NULL) == (owner && !bad));
++    p_sd_bus_message_unref(m);
++    if (!context->owner) context->owner = strdup(current_owner);
 +}
 +
-+static void test_signal( struct reachability_context *context, DBusMessage *message,
-+                         unsigned int requests, enum reachability_state state, BOOL changed )
++static void test_wait(struct reachability_context *context, enum reachability_state state, BOOL changed)
 +{
 +    struct reachability_wait_params params = {(UINT_PTR)context};
-+    unsigned int before = getalls;
-+
-+    signal_message = message;
-+    dispatch_context = context;
-+    check(!reachability_wait( &params ));
-+    check(getalls == before + requests);
++    check(p_sd_bus_message_rewind(response, TRUE) >= 0);
++    queued_signal = signal_message(FALSE, 0);
++    check(reachability_wait(&params) == STATUS_SUCCESS);
 +    check(params.state == state);
 +    check(params.changed == changed);
 +}
 +
-+static void run_tests(void)
++static BOOL run_tests(void)
 +{
 +    struct reachability_context context = {0};
-+    DBusMessageIter iter, array, variant;
-+    DBusMessage *message;
++    struct bus_message *m;
++    void *handle;
++    int sockets[2];
 +    unsigned int i;
-+    const char *extra = "extra";
-+    static const char *bad[] = {"{uv}", "{ss}", "{iv}"};
++    static const char *bad_dict[] = {"{uv}", "{ss}", "{iv}"};
++    int (*saved_async)(struct bus *, struct bus_slot **, struct bus_message *, bus_handler, void *, uint64_t);
++    int (*saved_process)(struct bus *, struct bus_message **);
 +
-+    check(load_dbus_functions());
-+    p_dbus_connection_send_with_reply_and_block = send_reply;
-+    p_dbus_connection_read_write_dispatch = dispatch;
-+    context.connection = (void *)1;
-+    for (i = 0; i < ARRAY_SIZE(bad); i++)
++    if (!load_bus_functions())
 +    {
-+        response = bad_dictionary( bad[i] );
-+        fprintf( stderr, "checking GetAll a%s\n", bad[i] );
-+        check(read_reachability( &context ) == REACHABILITY_INDETERMINATE);
-+        /* Bypass the outer signature guard to exercise the entry boundary. */
-+        assert(dbus_message_iter_init( response, &iter ));
-+        dbus_message_iter_recurse( &iter, &array );
-+        check(!next_dict_entry( &array, &variant ));
-+        dbus_message_unref( response );
++        fprintf(stderr, "D-Bus adversarial fixture: SKIP optional libsystemd unavailable\n");
++        return FALSE;
++    }
++    check((handle = dlopen("libsystemd.so.0", RTLD_NOW)) != NULL);
++#define LOAD(var, name) check((var = dlsym(handle, name)) != NULL)
++    LOAD(new_bus, "sd_bus_new"); LOAD(set_fd, "sd_bus_set_fd"); LOAD(start_bus, "sd_bus_start");
++    LOAD(new_message, "sd_bus_message_new"); LOAD(new_signal, "sd_bus_message_new_signal");
++    LOAD(set_sender, "sd_bus_message_set_sender"); LOAD(open_container, "sd_bus_message_open_container");
++    LOAD(close_container, "sd_bus_message_close_container"); LOAD(seal_message, "sd_bus_message_seal");
++    LOAD(get_member, "sd_bus_message_get_member");
++#undef LOAD
++    check(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
++    check(new_bus(&encoder) >= 0);
++    check(set_fd(encoder, sockets[0], sockets[0]) >= 0);
++    check(start_bus(encoder) >= 0);
++    for (i = 0; i < ARRAY_SIZE(bad_dict); i++)
++    {
++        uint32_t number = 1;
++        char entry[] = {bad_dict[i][1], bad_dict[i][2], 0};
++        check(new_message(encoder, &m, 2) >= 0);
++        check(open_container(m, 'a', bad_dict[i]) >= 0);
++        check(open_container(m, 'e', entry) >= 0);
++        check(p_sd_bus_message_append_basic(m, entry[0], entry[0] == 's' ? (void *)"Connectivity" : &number) >= 0);
++        if (entry[1] == 'v')
++        {
++            check(open_container(m, 'v', "u") >= 0);
++            check(p_sd_bus_message_append_basic(m, 'u', &number) >= 0);
++            check(close_container(m) >= 0);
++        }
++        else check(p_sd_bus_message_append_basic(m, 's', "wrong") >= 0);
++        check(close_container(m) >= 0);
++        check(close_container(m) >= 0);
++        seal(m);
++        check(read_properties(m) == REACHABILITY_INDETERMINATE);
++        p_sd_bus_message_unref(m);
 +    }
 +    for (i = 0; i < 8; i++)
 +    {
-+        response = properties( 4, i, 0 );
-+        check(read_reachability( &context ) == (i ? REACHABILITY_INDETERMINATE : REACHABILITY_ONLINE));
-+        dbus_message_unref( response );
-+        response = properties( 4, 0, i );
-+        check(read_reachability( &context ) == (i ? REACHABILITY_INDETERMINATE : REACHABILITY_ONLINE));
-+        dbus_message_unref( response );
++        m = properties(4, i, 0, 0, FALSE);
++        check(read_properties(m) == (i ? REACHABILITY_INDETERMINATE : REACHABILITY_ONLINE));
++        p_sd_bus_message_unref(m);
++        m = properties(4, 0, i, 0, FALSE);
++        check(read_properties(m) == (i ? REACHABILITY_INDETERMINATE : REACHABILITY_ONLINE));
++        p_sd_bus_message_unref(m);
 +    }
 +    for (i = 8; i <= 32; i *= 2)
 +    {
-+        response = properties( 4, i, 0 );
-+        check(read_reachability( &context ) == REACHABILITY_INDETERMINATE);
-+        dbus_message_unref( response );
++        m = properties(4, i, 0, 0, FALSE);
++        check(read_properties(m) == REACHABILITY_INDETERMINATE);
++        p_sd_bus_message_unref(m);
 +    }
 +    for (i = 0; i <= 5; i++)
 +    {
-+        response = properties( i, 0, 0 );
-+        check(read_reachability( &context ) == (!i || i == 5 ? REACHABILITY_INDETERMINATE :
-+                                                i == 4 ? REACHABILITY_ONLINE : REACHABILITY_OFFLINE));
-+        dbus_message_unref( response );
++        m = properties(i, 0, 0, 0, FALSE);
++        check(read_properties(m) == (!i || i == 5 ? REACHABILITY_INDETERMINATE : i == 4 ? REACHABILITY_ONLINE : REACHABILITY_OFFLINE));
++        p_sd_bus_message_unref(m);
 +    }
-+    response = dbus_message_new( DBUS_MESSAGE_TYPE_METHOD_RETURN );
-+    assert(dbus_message_append_args( response, DBUS_TYPE_STRING, &extra, DBUS_TYPE_INVALID ));
-+    check(read_reachability( &context ) == REACHABILITY_INDETERMINATE);
-+    assert(dbus_message_iter_init( response, &iter ));
-+    check(!next_dict_entry( &iter, &variant ));
-+    dbus_message_unref( response );
-+    response = properties( 4, 0, 0 );
-+    assert(dbus_message_append_args( response, DBUS_TYPE_STRING, &extra, DBUS_TYPE_INVALID ));
-+    check(read_reachability( &context ) == REACHABILITY_INDETERMINATE);
-+    dbus_message_unref( response );
-+    response = dbus_message_new( DBUS_MESSAGE_TYPE_METHOD_RETURN );
-+    check(read_reachability( &context ) == REACHABILITY_INDETERMINATE);
-+    dbus_message_unref( response );
-+    response = properties( 2, 0, 0 );
-+    context.state = REACHABILITY_ONLINE;
-+    for (i = 1; i <= 5; i++)
-+        test_signal( &context, properties_signal( current_owner, "org.freedesktop.NetworkManager", i ), 0, REACHABILITY_ONLINE, FALSE );
-+    test_signal( &context, properties_signal( current_owner, "foreign.interface", FALSE ), 0, REACHABILITY_ONLINE, FALSE );
-+    test_signal( &context, properties_signal( ":1.99", "org.freedesktop.NetworkManager", FALSE ), 0, REACHABILITY_ONLINE, FALSE );
-+    test_signal( &context, properties_signal( NULL, "org.freedesktop.NetworkManager", FALSE ), 0, REACHABILITY_ONLINE, FALSE );
-+    test_signal( &context, owner_signal( "org.freedesktop.DBus", TRUE ), 0, REACHABILITY_ONLINE, FALSE );
-+    test_signal( &context, owner_signal( ":1.99", FALSE ), 0, REACHABILITY_ONLINE, FALSE );
-+    for (i = 0; i < 4; i++)
++    for (i = 1; i <= 3; i++)
 +    {
-+        message = properties_signal( current_owner, "org.freedesktop.NetworkManager", FALSE );
-+        if (i == 0) assert(dbus_message_set_path( message, "/foreign" ));
-+        if (i == 1) assert(dbus_message_set_interface( message, "foreign.interface" ));
-+        if (i == 2) assert(dbus_message_set_member( message, "ForeignSignal" ));
-+        if (i == 3) assert(dbus_message_append_args( message, DBUS_TYPE_STRING, &extra, DBUS_TYPE_INVALID ));
-+        test_signal( &context, message, 0, REACHABILITY_ONLINE, FALSE );
++        m = properties(4, 0, 0, i, FALSE);
++        check(read_properties(m) == REACHABILITY_INDETERMINATE);
++        p_sd_bus_message_unref(m);
 +    }
-+    message = owner_signal( "org.freedesktop.DBus", FALSE );
-+    assert(dbus_message_set_path( message, "/foreign" ));
-+    test_signal( &context, message, 0, REACHABILITY_ONLINE, FALSE );
-+    message = owner_signal( "org.freedesktop.DBus", FALSE );
-+    assert(dbus_message_append_args( message, DBUS_TYPE_STRING, &extra, DBUS_TYPE_INVALID ));
-+    test_signal( &context, message, 0, REACHABILITY_ONLINE, FALSE );
-+    test_signal( &context, properties_signal( current_owner, "org.freedesktop.NetworkManager", FALSE ), 1, REACHABILITY_OFFLINE, TRUE );
-+    test_signal( &context, properties_signal( current_owner, "org.freedesktop.NetworkManager", FALSE ), 1, REACHABILITY_OFFLINE, FALSE );
++    m = properties(4, 0, 0, 0, TRUE);
++    check(read_properties(m) == REACHABILITY_INDETERMINATE);
++    p_sd_bus_message_unref(m);
++    for (i = 0; i < 2; i++)
++    {
++        check(new_message(encoder, &m, 2) >= 0);
++        if (i) check(p_sd_bus_message_append_basic(m, 's', "extra") >= 0);
++        seal(m);
++        check(read_properties(m) == REACHABILITY_INDETERMINATE);
++        p_sd_bus_message_unref(m);
++    }
++    context.owner = strdup(current_owner);
++    for (i = 1; i <= 14; i++)
++    {
++        if (i != 12 && i != 13) test_signal(&context, FALSE, i);
++        if (i != 4 && i != 5) test_signal(&context, TRUE, i);
++    }
++    test_signal(&context, FALSE, 0);
++    test_signal(&context, TRUE, 0);
++    saved_async = p_sd_bus_call_async;
++    saved_process = p_sd_bus_process;
++    p_sd_bus_call_async = async_reply;
++    p_sd_bus_process = process_reply;
++    context.connection = encoder;
++    dispatch_context = &context;
++    response = properties(4, 0, 0, 0, FALSE);
++    queued_signal = signal_message(TRUE, 0);
++    check(read_reachability(&context, monotonic_usec() + 1000000) == REACHABILITY_INDETERMINATE);
++    check(!context.owner && context.refresh);
 +    current_owner = ":1.11";
-+    test_signal( &context, owner_signal( "org.freedesktop.DBus", FALSE ), 1, REACHABILITY_OFFLINE, FALSE );
-+    dbus_message_unref( response );
-+    response = properties( 4, 0, 0 );
-+    test_signal( &context, properties_signal( ":1.10", "org.freedesktop.NetworkManager", FALSE ), 0, REACHABILITY_OFFLINE, FALSE );
-+    test_signal( &context, properties_signal( current_owner, "org.freedesktop.NetworkManager", FALSE ), 1, REACHABILITY_ONLINE, TRUE );
-+    /* A historical queued owner change must not reinstall the old owner. */
-+    test_signal( &context, owner_signal( "org.freedesktop.DBus", FALSE ), 1, REACHABILITY_ONLINE, FALSE );
-+    test_signal( &context, properties_signal( ":1.10", "org.freedesktop.NetworkManager", FALSE ), 0, REACHABILITY_ONLINE, FALSE );
-+    signal_message = properties_signal( current_owner, "org.freedesktop.NetworkManager", FALSE );
-+    signal_during_reply = TRUE;
-+    check(read_reachability( &context ) == REACHABILITY_ONLINE);
-+    dbus_message_unref( signal_message );
-+    signal_message = NULL;
-+    test_signal( &context, NULL, 1, REACHABILITY_ONLINE, FALSE );
-+    dbus_message_unref( response );
-+    response = bad_dictionary( "{uv}" );
-+    test_signal( &context, properties_signal( current_owner, "org.freedesktop.NetworkManager", FALSE ), 1,
-+                 REACHABILITY_INDETERMINATE, TRUE );
-+    dbus_message_unref( response );
-+    free( context.owner );
-+    /* Restore transport functions before the actual COM integration run. */
-+#define DO_FUNC(f) p_##f = f
-+    DBUS_FUNCS;
-+#undef DO_FUNC
-+    fprintf( stderr, "D-Bus adversarial fixture: %u checks passed\n", checks );
++    p_sd_bus_message_rewind(response, TRUE);
++    check(read_reachability(&context, monotonic_usec() + 1000000) == REACHABILITY_ONLINE);
++    current_owner = ":1.10";
++    test_signal(&context, FALSE, 9);
++    m = signal_message(FALSE, 0); /* stale sender :1.10 */
++    context.refresh = FALSE;
++    reachability_filter(m, &context, NULL);
++    check(!context.refresh);
++    p_sd_bus_message_unref(m);
++    current_owner = ":1.11";
++    queued_signal = signal_message(FALSE, 0);
++    p_sd_bus_message_rewind(response, TRUE);
++    check(read_reachability(&context, monotonic_usec() + 1000000) == REACHABILITY_ONLINE);
++    check(context.refresh); /* a change during GetAll remains armed */
++    context.state = REACHABILITY_ONLINE;
++    p_sd_bus_message_unref(response);
++    response = properties(2, 0, 0, 0, FALSE);
++    test_wait(&context, REACHABILITY_OFFLINE, TRUE);
++    test_wait(&context, REACHABILITY_OFFLINE, FALSE);
++    p_sd_bus_message_unref(response);
++    response = properties(4, 0, 0, 0, FALSE);
++    test_wait(&context, REACHABILITY_ONLINE, TRUE);
++    p_sd_bus_message_unref(response);
++    response = properties(4, 1, 0, 0, FALSE);
++    test_wait(&context, REACHABILITY_INDETERMINATE, TRUE);
++    p_sd_bus_call_async = saved_async;
++    p_sd_bus_process = saved_process;
++    p_sd_bus_message_unref(response);
++    free(context.owner);
++    p_sd_bus_close(encoder);
++    p_sd_bus_unref(encoder);
++    close(sockets[1]);
++    dlclose(handle);
++    fprintf(stderr, "D-Bus adversarial fixture: %u checks passed\n", checks);
++    return TRUE;
 +}
 +
++#ifdef FIXTURE_STANDALONE
++int main(void) { return run_tests() ? 0 : 77; }
++#else
 +static pthread_once_t tests_once = PTHREAD_ONCE_INIT;
-+
-+static NTSTATUS tested_start( void *args )
++static void run_once(void) { run_tests(); }
++static NTSTATUS tested_start(void *args)
 +{
-+    pthread_once( &tests_once, run_tests );
-+    return reachability_start( args );
++    pthread_once(&tests_once, run_once);
++    return reachability_start(args);
 +}
-+
 +const unixlib_entry_t __wine_unix_call_funcs[] =
 +{
 +    tested_start, reachability_wait, reachability_stop, topology_supported,
 +};
-+
 +#ifdef _WIN64
-+static NTSTATUS tested_start32( void *args )
++static NTSTATUS tested_start32(void *args)
 +{
-+    pthread_once( &tests_once, run_tests );
-+    return wow64_reachability_start( args );
++    pthread_once(&tests_once, run_once);
++    return wow64_reachability_start(args);
 +}
-+
 +const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 +{
 +    tested_start32, wow64_reachability_wait, wow64_reachability_stop, topology_supported,
 +};
++#endif
 +#endif
 diff --git a/dlls/netprofm/tests/dynamic-network.sh b/dlls/netprofm/tests/dynamic-network.sh
 new file mode 100755
@@ -4647,10 +5164,10 @@ index 0000000..80eb4fe
 +done
 diff --git a/dlls/netprofm/unixlib.c b/dlls/netprofm/unixlib.c
 new file mode 100644
-index 0000000..0bc88a1
+index 0000000..4295850
 --- /dev/null
 +++ b/dlls/netprofm/unixlib.c
-@@ -0,0 +1,520 @@
+@@ -0,0 +1,535 @@
 +/*
 + * Network List Manager Unix reachability provider
 + *
@@ -4678,13 +5195,13 @@ index 0000000..0bc88a1
 +#include "config.h"
 +
 +#include <dlfcn.h>
++#include <errno.h>
 +#include <poll.h>
 +#include <pthread.h>
++#include <stdint.h>
 +#include <stdlib.h>
 +#include <string.h>
-+#ifdef SONAME_LIBDBUS_1
-+# include <dbus/dbus.h>
-+#endif
++#include <time.h>
 +
 +#include "ntstatus.h"
 +#define WIN32_NO_STATUS
@@ -4694,249 +5211,292 @@ index 0000000..0bc88a1
 +#include "wine/unixlib.h"
 +#include "unixlib.h"
 +
-+#ifdef SONAME_LIBDBUS_1
++#if defined(__linux__) && defined(SONAME_LIBDBUS_1)
 +
 +WINE_DEFAULT_DEBUG_CHANNEL(netprofm);
 +
-+#define DBUS_FUNCS                                      \
-+    DO_FUNC(dbus_bus_add_match);                        \
-+    DO_FUNC(dbus_bus_get_private);                      \
-+    DO_FUNC(dbus_connection_add_filter);                \
-+    DO_FUNC(dbus_connection_close);                     \
-+    DO_FUNC(dbus_connection_read_write_dispatch);       \
-+    DO_FUNC(dbus_connection_send_with_reply_and_block); \
-+    DO_FUNC(dbus_connection_set_exit_on_disconnect);    \
-+    DO_FUNC(dbus_connection_unref);                     \
-+    DO_FUNC(dbus_error_free);                           \
-+    DO_FUNC(dbus_error_init);                           \
-+    DO_FUNC(dbus_message_get_args);                     \
-+    DO_FUNC(dbus_message_get_path);                     \
-+    DO_FUNC(dbus_message_get_sender);                   \
-+    DO_FUNC(dbus_message_has_signature);                \
-+    DO_FUNC(dbus_message_is_signal);                    \
-+    DO_FUNC(dbus_message_iter_append_basic);            \
-+    DO_FUNC(dbus_message_iter_get_arg_type);            \
-+    DO_FUNC(dbus_message_iter_get_basic);               \
-+    DO_FUNC(dbus_message_iter_init);                    \
-+    DO_FUNC(dbus_message_iter_init_append);             \
-+    DO_FUNC(dbus_message_iter_next);                    \
-+    DO_FUNC(dbus_message_iter_recurse);                 \
-+    DO_FUNC(dbus_message_new_method_call);              \
-+    DO_FUNC(dbus_message_set_auto_start);               \
-+    DO_FUNC(dbus_message_unref);                        \
-+    DO_FUNC(dbus_threads_init_default)
++/* Optional runtime-only sd-bus ABI. No systemd headers or link dependency.
++ * Unlike libdbus's open/register helpers, sd-bus connects with O_NONBLOCK.
++ * Keep the existing configure switch for builds that disable D-Bus entirely. */
++struct bus;
++struct bus_message;
++struct bus_slot;
++struct bus_error;
++typedef int (*bus_handler)(struct bus_message *, void *, struct bus_error *);
 +
-+#define DO_FUNC(f) static typeof(f) *p_##f
-+DBUS_FUNCS;
++#define BUS_FUNCS \
++    DO_FUNC(sd_bus_open_system, int, (struct bus **)); \
++    DO_FUNC(sd_bus_close, void, (struct bus *)); \
++    DO_FUNC(sd_bus_unref, struct bus *, (struct bus *)); \
++    DO_FUNC(sd_bus_is_ready, int, (struct bus *)); \
++    DO_FUNC(sd_bus_process, int, (struct bus *, struct bus_message **)); \
++    DO_FUNC(sd_bus_get_fd, int, (struct bus *)); \
++    DO_FUNC(sd_bus_get_events, int, (struct bus *)); \
++    DO_FUNC(sd_bus_get_timeout, int, (struct bus *, uint64_t *)); \
++    DO_FUNC(sd_bus_add_filter, int, (struct bus *, struct bus_slot **, bus_handler, void *)); \
++    DO_FUNC(sd_bus_call_async, int, (struct bus *, struct bus_slot **, struct bus_message *, bus_handler, void *, uint64_t)); \
++    DO_FUNC(sd_bus_slot_unref, struct bus_slot *, (struct bus_slot *)); \
++    DO_FUNC(sd_bus_message_new_method_call, int, (struct bus *, struct bus_message **, const char *, const char *, const char *, const char *)); \
++    DO_FUNC(sd_bus_message_ref, struct bus_message *, (struct bus_message *)); \
++    DO_FUNC(sd_bus_message_unref, struct bus_message *, (struct bus_message *)); \
++    DO_FUNC(sd_bus_message_set_auto_start, int, (struct bus_message *, int)); \
++    DO_FUNC(sd_bus_message_append_basic, int, (struct bus_message *, char, const void *)); \
++    DO_FUNC(sd_bus_message_read_basic, int, (struct bus_message *, char, void *)); \
++    DO_FUNC(sd_bus_message_enter_container, int, (struct bus_message *, char, const char *)); \
++    DO_FUNC(sd_bus_message_exit_container, int, (struct bus_message *)); \
++    DO_FUNC(sd_bus_message_peek_type, int, (struct bus_message *, char *, const char **)); \
++    DO_FUNC(sd_bus_message_skip, int, (struct bus_message *, const char *)); \
++    DO_FUNC(sd_bus_message_rewind, int, (struct bus_message *, int)); \
++    DO_FUNC(sd_bus_message_has_signature, int, (struct bus_message *, const char *)); \
++    DO_FUNC(sd_bus_message_is_method_error, int, (struct bus_message *, const char *)); \
++    DO_FUNC(sd_bus_message_is_signal, int, (struct bus_message *, const char *, const char *)); \
++    DO_FUNC(sd_bus_message_get_path, const char *, (struct bus_message *)); \
++    DO_FUNC(sd_bus_message_get_sender, const char *, (struct bus_message *))
++
++#define DO_FUNC(name, ret, args) static ret (*p_##name) args
++BUS_FUNCS;
 +#undef DO_FUNC
 +
 +struct reachability_context
 +{
-+    DBusConnection *connection;
++    struct bus *connection;
 +    char *owner;
 +    enum reachability_state state;
 +    BOOL refresh;
++    unsigned int owner_generation;
 +    unsigned int retry_count;
 +    unsigned int reconnect_count;
 +};
 +
-+static pthread_once_t dbus_once = PTHREAD_ONCE_INIT;
-+static BOOL dbus_loaded;
++static pthread_once_t bus_once = PTHREAD_ONCE_INIT;
++static BOOL bus_loaded;
 +
-+static void load_dbus_functions_once(void)
++static void disconnect_reachability( struct reachability_context *context );
++
++static void load_bus_functions_once(void)
 +{
 +    void *handle;
 +
-+    if (!(handle = dlopen( SONAME_LIBDBUS_1, RTLD_NOW ))) goto failed;
-+
-+#define DO_FUNC(f) if (!(p_##f = dlsym( handle, #f ))) goto failed
-+    DBUS_FUNCS;
++    if (!(handle = dlopen( "libsystemd.so.0", RTLD_NOW ))) goto failed;
++#define DO_FUNC(name, ret, args) if (!(p_##name = dlsym( handle, #name ))) goto failed
++    BUS_FUNCS;
 +#undef DO_FUNC
-+    dbus_loaded = TRUE;
++    bus_loaded = TRUE;
 +    return;
-+
 +failed:
-+    WARN( "failed to load D-Bus support: %s\n", dlerror() );
++    WARN( "failed to load optional sd-bus support: %s\n", dlerror() );
 +}
 +
-+static BOOL load_dbus_functions(void)
++static BOOL load_bus_functions(void)
 +{
-+    pthread_once( &dbus_once, load_dbus_functions_once );
-+    return dbus_loaded;
++    pthread_once( &bus_once, load_bus_functions_once );
++    return bus_loaded;
 +}
 +
-+static const char *next_dict_entry( DBusMessageIter *iter, DBusMessageIter *variant )
++static uint64_t monotonic_usec(void)
 +{
-+    DBusMessageIter entry;
-+    const char *name;
-+
-+    if (p_dbus_message_iter_get_arg_type( iter ) != DBUS_TYPE_DICT_ENTRY) return NULL;
-+    p_dbus_message_iter_recurse( iter, &entry );
-+    if (p_dbus_message_iter_get_arg_type( &entry ) != DBUS_TYPE_STRING) return NULL;
-+    p_dbus_message_iter_get_basic( &entry, &name );
-+    if (!name || !p_dbus_message_iter_next( &entry ) ||
-+        p_dbus_message_iter_get_arg_type( &entry ) != DBUS_TYPE_VARIANT) return NULL;
-+    p_dbus_message_iter_recurse( &entry, variant );
-+    if (p_dbus_message_iter_get_arg_type( variant ) == DBUS_TYPE_INVALID ||
-+        p_dbus_message_iter_next( &entry )) return NULL;
-+    p_dbus_message_iter_next( iter );
-+    return name;
++    struct timespec ts;
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 +}
 +
-+static BOOL read_owner( struct reachability_context *context )
++/* Reject transports that could perform DNS, launch a process, or enter a
++ * container. Validate every alternative, not just the first working entry. */
++static BOOL local_bus_address( const char *address )
 +{
-+    const char *name = "org.freedesktop.NetworkManager", *owner;
-+    DBusMessage *request, *reply;
-+    DBusMessageIter iter;
-+    DBusError error;
++    const char *entry, *end, *value, *next;
++    unsigned int sockets;
 +
-+    free( context->owner );
-+    context->owner = NULL;
-+    request = p_dbus_message_new_method_call( "org.freedesktop.DBus", "/org/freedesktop/DBus",
-+                                             "org.freedesktop.DBus", "GetNameOwner" );
-+    if (!request) return FALSE;
-+    p_dbus_message_iter_init_append( request, &iter );
-+    if (!p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &name ))
++    if (!address) return TRUE; /* sd-bus's system-bus default */
++    for (entry = address; *entry; entry = end + 1)
 +    {
-+        p_dbus_message_unref( request );
-+        return FALSE;
-+    }
-+    p_dbus_error_init( &error );
-+    reply = p_dbus_connection_send_with_reply_and_block( context->connection, request, 1000, &error );
-+    p_dbus_message_unref( request );
-+    if (reply)
-+    {
-+        if (p_dbus_message_has_signature( reply, "s" ) &&
-+            p_dbus_message_get_args( reply, &error, DBUS_TYPE_STRING, &owner, DBUS_TYPE_INVALID ) &&
-+            owner[0] == ':')
-+            context->owner = strdup( owner );
-+        p_dbus_message_unref( reply );
-+    }
-+    p_dbus_error_free( &error );
-+    return !!context->owner;
-+}
-+
-+static enum reachability_state read_reachability( struct reachability_context *context )
-+{
-+    static const char path[] = "/org/freedesktop/NetworkManager";
-+    static const char properties[] = "org.freedesktop.DBus.Properties";
-+    static const char interface[] = "org.freedesktop.NetworkManager";
-+    DBusMessageIter iter, array, variant;
-+    DBusMessage *request, *reply;
-+    dbus_uint32_t connectivity = 0;
-+    dbus_bool_t available = FALSE, enabled = FALSE;
-+    BOOL have_connectivity = FALSE, have_available = FALSE, have_enabled = FALSE;
-+    DBusError error;
-+    const char *name;
-+
-+    /* Resolve outside the filter. A queued owner change can predate this
-+     * snapshot, so never install an owner from a signal's historical body. */
-+    context->refresh = FALSE;
-+    if (!read_owner( context )) return REACHABILITY_INDETERMINATE;
-+    request = p_dbus_message_new_method_call( context->owner, path, properties, "GetAll" );
-+    if (!request) return REACHABILITY_INDETERMINATE;
-+    /* The provider observes an existing service; it must never activate one. */
-+    p_dbus_message_set_auto_start( request, FALSE );
-+    p_dbus_message_iter_init_append( request, &iter );
-+    name = interface;
-+    if (!p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &name ))
-+    {
-+        p_dbus_message_unref( request );
-+        return REACHABILITY_INDETERMINATE;
-+    }
-+
-+    p_dbus_error_init( &error );
-+    reply = p_dbus_connection_send_with_reply_and_block( context->connection, request, 1000, &error );
-+    p_dbus_message_unref( request );
-+    if (!reply)
-+    {
-+        p_dbus_error_free( &error );
-+        return REACHABILITY_INDETERMINATE;
-+    }
-+    p_dbus_error_free( &error );
-+
-+    if (p_dbus_message_has_signature( reply, "a{sv}" ) &&
-+        p_dbus_message_iter_init( reply, &iter ) &&
-+        p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_ARRAY)
-+    {
-+        p_dbus_message_iter_recurse( &iter, &array );
-+        while (p_dbus_message_iter_get_arg_type( &array ) != DBUS_TYPE_INVALID)
++        end = strchr( entry, ';' );
++        if (!end) end = entry + strlen( entry );
++        if (end - entry < 6 || strncmp( entry, "unix:", 5 )) return FALSE;
++        sockets = 0;
++        for (value = entry + 5; value < end; value = next + 1)
 +        {
-+            if (!(name = next_dict_entry( &array, &variant ))) goto malformed;
-+            if (!strcmp( name, "Connectivity" ))
-+            {
-+                if (have_connectivity || p_dbus_message_iter_get_arg_type( &variant ) != DBUS_TYPE_UINT32)
-+                    goto malformed;
-+                p_dbus_message_iter_get_basic( &variant, &connectivity );
-+                have_connectivity = TRUE;
-+            }
-+            else if (!strcmp( name, "ConnectivityCheckAvailable" ))
-+            {
-+                if (have_available || p_dbus_message_iter_get_arg_type( &variant ) != DBUS_TYPE_BOOLEAN)
-+                    goto malformed;
-+                p_dbus_message_iter_get_basic( &variant, &available );
-+                have_available = TRUE;
-+            }
-+            else if (!strcmp( name, "ConnectivityCheckEnabled" ))
-+            {
-+                if (have_enabled || p_dbus_message_iter_get_arg_type( &variant ) != DBUS_TYPE_BOOLEAN)
-+                    goto malformed;
-+                p_dbus_message_iter_get_basic( &variant, &enabled );
-+                have_enabled = TRUE;
-+            }
++            next = memchr( value, ',', end - value );
++            if (!next) next = end;
++            if (next - value > 5 && !strncmp( value, "path=", 5 )) sockets++;
++            else if (next - value > 9 && !strncmp( value, "abstract=", 9 )) sockets++;
++            else if (next - value <= 5 || strncmp( value, "guid=", 5 )) return FALSE;
++            if (next == end) break;
++            if (next + 1 == end) return FALSE;
 +        }
++        if (sockets != 1) return FALSE;
++        if (!*end) return TRUE;
++        if (!end[1]) return FALSE;
 +    }
-+    p_dbus_message_unref( reply );
++    return FALSE;
++}
 +
-+    if (!have_connectivity || !have_available || !have_enabled || !available || !enabled || !connectivity)
++/* Every invocation has one absolute deadline, including AUTH, Hello, match
++ * installation, and snapshot queries. Never flush or use blocking bus calls.
++ * Dispatch work also consumes the budget, including a continuous signal flood. */
++static BOOL pump_bus( struct reachability_context *context, uint64_t deadline,
++                      struct bus_message **reply, BOOL connecting )
++{
++    struct pollfd fd;
++    uint64_t now, timeout;
++    int ret;
++
++    while ((now = monotonic_usec()) < deadline)
++    {
++        if ((ret = p_sd_bus_process( context->connection, NULL )) < 0) return FALSE;
++        if (reply && *reply) return TRUE;
++        if (connecting && p_sd_bus_is_ready( context->connection ) > 0) return TRUE;
++        if (ret) continue;
++        if ((fd.fd = p_sd_bus_get_fd( context->connection )) < 0 ||
++            (ret = p_sd_bus_get_events( context->connection )) < 0 ||
++            p_sd_bus_get_timeout( context->connection, &timeout ) < 0) return FALSE;
++        fd.events = ret;
++        if (timeout > deadline) timeout = deadline;
++        now = monotonic_usec();
++        ret = poll( &fd, 1, timeout > now ? (timeout - now + 999) / 1000 : 0 );
++        if (ret < 0 && errno != EINTR) return FALSE;
++    }
++    return !reply && !connecting;
++}
++
++static int capture_reply( struct bus_message *message, void *data, struct bus_error *error )
++{
++    struct bus_message **reply = data;
++    *reply = p_sd_bus_message_ref( message );
++    return 1;
++}
++
++static struct bus_message *call_method( struct reachability_context *context, uint64_t deadline,
++                                       const char *destination, const char *path,
++                                       const char *interface, const char *method, const char *arg )
++{
++    struct bus_message *request = NULL, *reply = NULL;
++    struct bus_slot *slot = NULL;
++    uint64_t now = monotonic_usec();
++    BOOL completed = FALSE;
++
++    if (now >= deadline || p_sd_bus_message_new_method_call( context->connection, &request,
++                           destination, path, interface, method ) < 0) return NULL;
++    if (p_sd_bus_message_set_auto_start( request, FALSE ) < 0 ||
++        p_sd_bus_message_append_basic( request, 's', arg ) < 0 ||
++        p_sd_bus_call_async( context->connection, &slot, request, capture_reply, &reply,
++                            deadline - now ) < 0) goto done;
++    completed = pump_bus( context, deadline, &reply, FALSE );
++done:
++    /* Cancel the callback before its stack userdata goes out of scope. */
++    p_sd_bus_slot_unref( slot );
++    p_sd_bus_message_unref( request );
++    /* An unanswered/nonreading peer must not accumulate queued requests on
++     * every retry. Drop the transport as well as the pending callback. */
++    if (!completed || (reply && p_sd_bus_message_is_method_error( reply,
++                                    "org.freedesktop.DBus.Error.NoReply" ) > 0))
++        disconnect_reachability( context );
++    if (reply && p_sd_bus_message_is_method_error( reply, NULL ) > 0)
++        reply = p_sd_bus_message_unref( reply );
++    return reply;
++}
++
++static enum reachability_state read_properties( struct bus_message *reply )
++{
++    uint32_t connectivity = 0;
++    int available = FALSE, enabled = FALSE, ret;
++    BOOL have_connectivity = FALSE, have_available = FALSE, have_enabled = FALSE;
++    const char *name, *contents;
++    char type;
++
++    if (p_sd_bus_message_has_signature( reply, "a{sv}" ) <= 0 ||
++        p_sd_bus_message_enter_container( reply, 'a', "{sv}" ) <= 0) return REACHABILITY_INDETERMINATE;
++    while ((ret = p_sd_bus_message_enter_container( reply, 'e', "sv" )) > 0)
++    {
++        if (p_sd_bus_message_read_basic( reply, 's', &name ) <= 0 ||
++            p_sd_bus_message_peek_type( reply, &type, &contents ) <= 0 || type != 'v')
++            return REACHABILITY_INDETERMINATE;
++        if (!strcmp( name, "Connectivity" ))
++        {
++            if (have_connectivity || strcmp( contents, "u" ) ||
++                p_sd_bus_message_enter_container( reply, 'v', "u" ) <= 0 ||
++                p_sd_bus_message_read_basic( reply, 'u', &connectivity ) <= 0 ||
++                p_sd_bus_message_exit_container( reply ) < 0) return REACHABILITY_INDETERMINATE;
++            have_connectivity = TRUE;
++        }
++        else if (!strcmp( name, "ConnectivityCheckAvailable" ) || !strcmp( name, "ConnectivityCheckEnabled" ))
++        {
++            BOOL is_available = !strcmp( name, "ConnectivityCheckAvailable" );
++            if ((is_available ? have_available : have_enabled) || strcmp( contents, "b" ) ||
++                p_sd_bus_message_enter_container( reply, 'v', "b" ) <= 0 ||
++                p_sd_bus_message_read_basic( reply, 'b', is_available ? &available : &enabled ) <= 0 ||
++                p_sd_bus_message_exit_container( reply ) < 0) return REACHABILITY_INDETERMINATE;
++            if (is_available) have_available = TRUE;
++            else have_enabled = TRUE;
++        }
++        else if (p_sd_bus_message_skip( reply, "v" ) < 0) return REACHABILITY_INDETERMINATE;
++        if (p_sd_bus_message_exit_container( reply ) < 0) return REACHABILITY_INDETERMINATE;
++    }
++    if (ret < 0 || p_sd_bus_message_exit_container( reply ) < 0 ||
++        !have_connectivity || !have_available || !have_enabled || !available || !enabled || !connectivity)
 +        return REACHABILITY_INDETERMINATE;
 +    if (connectivity == 4) return REACHABILITY_ONLINE;
 +    if (connectivity <= 3) return REACHABILITY_OFFLINE;
 +    return REACHABILITY_INDETERMINATE;
-+
-+malformed:
-+    p_dbus_message_unref( reply );
-+    return REACHABILITY_INDETERMINATE;
 +}
 +
-+static DBusHandlerResult reachability_filter( DBusConnection *connection, DBusMessage *message, void *data )
++static enum reachability_state read_reachability( struct reachability_context *context, uint64_t deadline )
++{
++    struct bus_message *reply;
++    const char *owner;
++    unsigned int generation = context->owner_generation;
++    enum reachability_state state = REACHABILITY_INDETERMINATE;
++
++    context->refresh = FALSE;
++    free( context->owner );
++    context->owner = NULL;
++    reply = call_method( context, deadline, "org.freedesktop.DBus", "/org/freedesktop/DBus",
++                         "org.freedesktop.DBus", "GetNameOwner", "org.freedesktop.NetworkManager" );
++    if (!reply) return state;
++    if (p_sd_bus_message_has_signature( reply, "s" ) > 0 &&
++        p_sd_bus_message_read_basic( reply, 's', &owner ) > 0 && owner[0] == ':' &&
++        generation == context->owner_generation) context->owner = strdup( owner );
++    p_sd_bus_message_unref( reply );
++    if (!context->owner) return state;
++    reply = call_method( context, deadline, context->owner, "/org/freedesktop/NetworkManager",
++                         "org.freedesktop.DBus.Properties", "GetAll", "org.freedesktop.NetworkManager" );
++    if (!reply) return state;
++    /* A late reply from an owner that vanished while we pumped cannot restore
++     * its snapshot. The owner-change signal leaves refresh armed for a retry. */
++    if (generation == context->owner_generation) state = read_properties( reply );
++    p_sd_bus_message_unref( reply );
++    return state;
++}
++
++static int reachability_filter( struct bus_message *message, void *data, struct bus_error *error )
 +{
 +    struct reachability_context *context = data;
 +    const char *name, *old_owner, *new_owner;
-+    const char *sender = p_dbus_message_get_sender( message );
-+    const char *path = p_dbus_message_get_path( message );
-+    DBusMessageIter iter;
-+    DBusError error;
++    const char *sender = p_sd_bus_message_get_sender( message );
++    const char *path = p_sd_bus_message_get_path( message );
 +
-+    if (p_dbus_message_is_signal( message, "org.freedesktop.DBus.Properties", "PropertiesChanged" ) &&
-+        p_dbus_message_has_signature( message, "sa{sv}as" ) &&
++    if (p_sd_bus_message_is_signal( message, "org.freedesktop.DBus.Properties", "PropertiesChanged" ) > 0 &&
++        p_sd_bus_message_has_signature( message, "sa{sv}as" ) > 0 &&
 +        path && !strcmp( path, "/org/freedesktop/NetworkManager" ) &&
 +        sender && context->owner && !strcmp( sender, context->owner ) &&
-+        p_dbus_message_iter_init( message, &iter ) &&
-+        p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_STRING)
-+    {
-+        p_dbus_message_iter_get_basic( &iter, &name );
-+        if (name && !strcmp( name, "org.freedesktop.NetworkManager" )) context->refresh = TRUE;
-+    }
-+    else if (p_dbus_message_is_signal( message, "org.freedesktop.DBus", "NameOwnerChanged" ) &&
-+             p_dbus_message_has_signature( message, "sss" ) &&
++        p_sd_bus_message_read_basic( message, 's', &name ) > 0 &&
++        !strcmp( name, "org.freedesktop.NetworkManager" )) context->refresh = TRUE;
++    else if (p_sd_bus_message_is_signal( message, "org.freedesktop.DBus", "NameOwnerChanged" ) > 0 &&
++             p_sd_bus_message_has_signature( message, "sss" ) > 0 &&
 +             path && !strcmp( path, "/org/freedesktop/DBus" ) &&
-+             sender && !strcmp( sender, "org.freedesktop.DBus" ))
++             sender && !strcmp( sender, "org.freedesktop.DBus" ) &&
++             p_sd_bus_message_read_basic( message, 's', &name ) > 0 &&
++             p_sd_bus_message_read_basic( message, 's', &old_owner ) > 0 &&
++             p_sd_bus_message_read_basic( message, 's', &new_owner ) > 0 &&
++             !strcmp( name, "org.freedesktop.NetworkManager" ) &&
++             (!old_owner[0] || old_owner[0] == ':') && (!new_owner[0] || new_owner[0] == ':'))
 +    {
-+        p_dbus_error_init( &error );
-+        if (p_dbus_message_get_args( message, &error, DBUS_TYPE_STRING, &name,
-+                                     DBUS_TYPE_STRING, &old_owner, DBUS_TYPE_STRING, &new_owner,
-+                                     DBUS_TYPE_INVALID ) &&
-+            !strcmp( name, "org.freedesktop.NetworkManager" ) &&
-+            (!old_owner[0] || old_owner[0] == ':') && (!new_owner[0] || new_owner[0] == ':'))
-+        {
-+            free( context->owner );
-+            context->owner = NULL;
-+            context->refresh = TRUE;
-+        }
-+        p_dbus_error_free( &error );
++        free( context->owner );
++        context->owner = NULL;
++        context->owner_generation++;
++        context->refresh = TRUE;
 +    }
-+    return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
++    return 0;
 +}
 +
 +static void disconnect_reachability( struct reachability_context *context )
@@ -4944,51 +5504,36 @@ index 0000000..0bc88a1
 +    free( context->owner );
 +    context->owner = NULL;
 +    if (!context->connection) return;
-+    p_dbus_connection_close( context->connection );
-+    p_dbus_connection_unref( context->connection );
-+    context->connection = NULL;
++    /* Close without flushing; teardown must not wait for a remote peer. */
++    p_sd_bus_close( context->connection );
++    context->connection = p_sd_bus_unref( context->connection );
 +}
 +
-+static BOOL add_match( DBusConnection *connection, const char *match )
++static BOOL connect_reachability( struct reachability_context *context, uint64_t deadline )
 +{
-+    DBusError error;
-+
-+    p_dbus_error_init( &error );
-+    p_dbus_bus_add_match( connection, match, &error );
-+    if (error.name)
++    static const char *matches[] =
 +    {
-+        WARN( "failed to add D-Bus match %s: %s\n", debugstr_a(match), debugstr_a(error.message) );
-+        p_dbus_error_free( &error );
-+        return FALSE;
++        "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',"
++        "path='/org/freedesktop/NetworkManager',sender='org.freedesktop.NetworkManager',arg0='org.freedesktop.NetworkManager'",
++        "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.freedesktop.NetworkManager',"
++        "sender='org.freedesktop.DBus',path='/org/freedesktop/DBus'"
++    };
++    struct bus_message *reply;
++    unsigned int i;
++
++    if (!local_bus_address( getenv( "DBUS_SYSTEM_BUS_ADDRESS" ) ) ||
++        p_sd_bus_open_system( &context->connection ) < 0) return FALSE;
++    if (!pump_bus( context, deadline, NULL, TRUE ) ||
++        p_sd_bus_add_filter( context->connection, NULL, reachability_filter, context ) < 0) goto failed;
++    for (i = 0; i < ARRAY_SIZE(matches); i++)
++    {
++        reply = call_method( context, deadline, "org.freedesktop.DBus", "/org/freedesktop/DBus",
++                             "org.freedesktop.DBus", "AddMatch", matches[i] );
++        if (!reply) goto failed;
++        p_sd_bus_message_unref( reply );
 +    }
-+    p_dbus_error_free( &error );
-+    return TRUE;
-+}
-+
-+static BOOL connect_reachability( struct reachability_context *context )
-+{
-+    static const char properties_match[] = "type='signal',interface='org.freedesktop.DBus.Properties',"
-+                                           "member='PropertiesChanged',path='/org/freedesktop/NetworkManager',"
-+                                           "sender='org.freedesktop.NetworkManager',arg0='org.freedesktop.NetworkManager'";
-+    static const char owner_match[] = "type='signal',interface='org.freedesktop.DBus',"
-+                                      "member='NameOwnerChanged',arg0='org.freedesktop.NetworkManager',"
-+                                      "sender='org.freedesktop.DBus',path='/org/freedesktop/DBus'";
-+    DBusError error;
-+
-+    p_dbus_error_init( &error );
-+    context->connection = p_dbus_bus_get_private( DBUS_BUS_SYSTEM, &error );
-+    p_dbus_error_free( &error );
-+    if (!context->connection) return FALSE;
-+
-+    p_dbus_connection_set_exit_on_disconnect( context->connection, FALSE );
-+    if (!p_dbus_connection_add_filter( context->connection, reachability_filter, context, NULL ))
-+        goto failed;
-+
-+    if (!add_match( context->connection, properties_match ) ||
-+        !add_match( context->connection, owner_match )) goto failed;
 +    context->reconnect_count = 0;
 +    return TRUE;
-+
 +failed:
 +    disconnect_reachability( context );
 +    return FALSE;
@@ -4998,13 +5543,12 @@ index 0000000..0bc88a1
 +{
 +    struct reachability_start_params *params = args;
 +    struct reachability_context *context;
++    uint64_t deadline = monotonic_usec() + 1000000;
 +
-+    if (!load_dbus_functions()) return STATUS_NOT_SUPPORTED;
-+    if (!p_dbus_threads_init_default()) return STATUS_NO_MEMORY;
++    if (!load_bus_functions()) return STATUS_NOT_SUPPORTED;
 +    if (!(context = calloc( 1, sizeof(*context) ))) return STATUS_NO_MEMORY;
-+
-+    context->state = connect_reachability( context ) ? read_reachability( context )
-+                                                     : REACHABILITY_INDETERMINATE;
++    context->state = connect_reachability( context, deadline ) ? read_reachability( context, deadline )
++                                                               : REACHABILITY_INDETERMINATE;
 +    params->state = context->state;
 +    params->handle = (UINT_PTR)context;
 +    return STATUS_SUCCESS;
@@ -5014,6 +5558,7 @@ index 0000000..0bc88a1
 +{
 +    struct reachability_wait_params *params = args;
 +    struct reachability_context *context = (void *)(UINT_PTR)params->handle;
++    uint64_t deadline = monotonic_usec() + 1000000;
 +    enum reachability_state state;
 +    BOOL retry = FALSE;
 +
@@ -5024,7 +5569,7 @@ index 0000000..0bc88a1
 +        if (++context->reconnect_count >= 4)
 +        {
 +            context->reconnect_count = 0;
-+            if (connect_reachability( context )) state = read_reachability( context );
++            if (connect_reachability( context, deadline )) state = read_reachability( context, deadline );
 +        }
 +        goto done;
 +    }
@@ -5033,14 +5578,13 @@ index 0000000..0bc88a1
 +        context->retry_count = 0;
 +        retry = TRUE;
 +    }
-+    if (!p_dbus_connection_read_write_dispatch( context->connection, 250 ))
++    if (!pump_bus( context, monotonic_usec() + 250000, NULL, FALSE ))
 +    {
 +        disconnect_reachability( context );
 +        state = REACHABILITY_INDETERMINATE;
 +    }
-+    else if (context->refresh || retry) state = read_reachability( context );
++    else if (context->refresh || retry) state = read_reachability( context, deadline );
 +    else state = context->state;
-+
 +done:
 +    params->changed = state != context->state;
 +    params->state = context->state = state;
@@ -5051,13 +5595,12 @@ index 0000000..0bc88a1
 +{
 +    const struct reachability_stop_params *params = args;
 +    struct reachability_context *context = (void *)(UINT_PTR)params->handle;
-+
 +    disconnect_reachability( context );
 +    free( context );
 +    return STATUS_SUCCESS;
 +}
 +
-+#else /* SONAME_LIBDBUS_1 */
++#else /* Linux optional D-Bus provider */
 +
 +static NTSTATUS reachability_start( void *args )
 +{
@@ -5074,10 +5617,8 @@ index 0000000..0bc88a1
 +    return STATUS_NOT_SUPPORTED;
 +}
 +
-+#endif /* SONAME_LIBDBUS_1 */
++#endif /* Linux optional D-Bus provider */
 +
-+/* Match the link/route notification backend, independently of D-Bus and of
-+ * whether a particular manager succeeds in starting its monitor threads. */
 +static NTSTATUS topology_supported( void *args )
 +{
 +#ifdef HAVE_LINUX_RTNETLINK_H
@@ -5089,10 +5630,7 @@ index 0000000..0bc88a1
 +
 +const unixlib_entry_t __wine_unix_call_funcs[] =
 +{
-+    reachability_start,
-+    reachability_wait,
-+    reachability_stop,
-+    topology_supported,
++    reachability_start, reachability_wait, reachability_stop, topology_supported,
 +};
 +
 +C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
@@ -5129,7 +5667,6 @@ index 0000000..0bc88a1
 +    struct reachability_start_params32 *params32 = args;
 +    struct reachability_start_params params = {0};
 +    NTSTATUS status;
-+
 +    if (!(status = reachability_start( &params )))
 +    {
 +        params32->handle = params.handle;
@@ -5143,7 +5680,6 @@ index 0000000..0bc88a1
 +    struct reachability_wait_params32 *params32 = args;
 +    struct reachability_wait_params params = {params32->handle};
 +    NTSTATUS status;
-+
 +    if (!(status = reachability_wait( &params )))
 +    {
 +        params32->state = params.state;
@@ -5156,16 +5692,12 @@ index 0000000..0bc88a1
 +{
 +    const struct reachability_stop_params32 *params32 = args;
 +    struct reachability_stop_params params = {params32->handle};
-+
 +    return reachability_stop( &params );
 +}
 +
 +const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 +{
-+    wow64_reachability_start,
-+    wow64_reachability_wait,
-+    wow64_reachability_stop,
-+    topology_supported,
++    wow64_reachability_start, wow64_reachability_wait, wow64_reachability_stop, topology_supported,
 +};
 +
 +C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
