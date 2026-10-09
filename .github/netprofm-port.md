@@ -50,6 +50,13 @@ build tree (it requires passwordless sudo and private mount/network namespaces):
 .github/check-netprofm.sh /path/to/prepared-wine /path/to/build /path/to/new-logs
 ```
 
+The wrapper, source, build and new log directory must resolve outside `/tmp`:
+the wrapper replaces `/tmp` with an isolated fixture workspace. Symlinks into
+`/tmp` are rejected before logs are created or privileged commands run. Use a
+checkout/build under your home directory and place logs there as well.
+Run `.github/tests/check-netprofm-paths.sh` for the unprivileged path-validation
+regression check; it does not run Wine or the network fixtures.
+
 The inherited Soda workflow discovers the new `.mypatch` automatically. No CI
 or release workflow was triggered or changed to prepare this local branch.
 

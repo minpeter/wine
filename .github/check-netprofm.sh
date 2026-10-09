@@ -5,8 +5,17 @@ set -euo pipefail
 if [[ ${1-} != --inside ]]; then
     source_dir=$(realpath "${1:?usage: $0 WINE_SOURCE WINE_BUILD NEW_LOG_DIRECTORY}")
     build_dir=$(realpath "${2:?missing Wine build directory}")
-    mkdir "${3:?log directory must not already exist}"
-    logs=$(realpath "$3")
+    logs=$(realpath -m "${3:?log directory must not already exist}")
+    wrapper=$(realpath "$0")
+    # These paths must survive the private /tmp mount. Resolve symlinks before
+    # checking, and reject before creating logs or running privileged commands.
+    for path in "$source_dir" "$build_dir" "$logs" "$wrapper"; do
+        if [[ $path == /tmp || $path == /tmp/* ]]; then
+            echo "Paths under /tmp are unavailable after isolation: $path. Use a location outside /tmp." >&2
+            exit 1
+        fi
+    done
+    mkdir "$logs"
     # The imported tests use fixed /tmp names. A private mount prevents them
     # from removing another run's prefixes, markers, sockets, or logs.
     scratch=$(mktemp -d)
@@ -19,7 +28,7 @@ if [[ ${1-} != --inside ]]; then
         exec setpriv --reuid="$1" --regid="$2" --init-groups \
             env HOME="$3" bash "$4" --inside "$5" "$6" "$7"
     ' bash "$scratch" "$(id -u)" "$(id -g)" "$HOME" \
-        "$(realpath "$0")" "$source_dir" "$build_dir" "$logs"
+        "$wrapper" "$source_dir" "$build_dir" "$logs"
     exit
 fi
 
