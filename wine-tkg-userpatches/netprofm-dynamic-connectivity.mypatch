@@ -1,4 +1,4 @@
-From c73500c5822b62208207793932961e1e95ac866d Mon Sep 17 00:00:00 2001
+From 91ef4b316fa007e1e030d7f413797dbe782c61ee Mon Sep 17 00:00:00 2001
 From: Woonggi Min <62207008+minpeter@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 19:00:58 +0900
 Subject: [PATCH] netprofm: Port reviewed dynamic connectivity and fault
@@ -32,7 +32,8 @@ Amp-Thread-ID: https://ampcode.com/threads/T-01a0fc5f-d85f-778a-8561-d4ea9af67f8
  dlls/netprofm/tests/nsi-backend.c             | 104 +++
  dlls/netprofm/tests/nsi-device.c              | 200 +++++
  dlls/netprofm/tests/nsi-faults.c              | 204 +++++
- dlls/netprofm/tests/nsi-faults.sh             | 144 +++
+ dlls/netprofm/tests/nsi-faults.sh             | 211 +++++
+ dlls/netprofm/tests/nsi-large-route.c         |  86 ++
  dlls/netprofm/tests/reachability-network.sh   | 274 ++++++
  dlls/netprofm/tests/topology-backend.c        |  58 ++
  dlls/netprofm/tests/topology-policy.sh        |  83 ++
@@ -41,10 +42,10 @@ Amp-Thread-ID: https://ampcode.com/threads/T-01a0fc5f-d85f-778a-8561-d4ea9af67f8
  dlls/nsiproxy.sys/device.c                    |  43 +-
  dlls/nsiproxy.sys/ip.c                        |  46 +-
  dlls/nsiproxy.sys/ndis.c                      |  35 +-
- dlls/nsiproxy.sys/nsi.c                       |  27 +-
+ dlls/nsiproxy.sys/nsi.c                       |  68 +-
  include/netlistmgr.idl                        |  10 +
  include/wine/nsi.h                            |   5 +
- 32 files changed, 5046 insertions(+), 139 deletions(-)
+ 33 files changed, 5235 insertions(+), 144 deletions(-)
  create mode 100755 dlls/netprofm/tests/adversarial.sh
  create mode 100644 dlls/netprofm/tests/bus-stalls.c
  create mode 100644 dlls/netprofm/tests/bus-stalls.py
@@ -59,6 +60,7 @@ Amp-Thread-ID: https://ampcode.com/threads/T-01a0fc5f-d85f-778a-8561-d4ea9af67f8
  create mode 100644 dlls/netprofm/tests/nsi-device.c
  create mode 100644 dlls/netprofm/tests/nsi-faults.c
  create mode 100755 dlls/netprofm/tests/nsi-faults.sh
+ create mode 100644 dlls/netprofm/tests/nsi-large-route.c
  create mode 100755 dlls/netprofm/tests/reachability-network.sh
  create mode 100644 dlls/netprofm/tests/topology-backend.c
  create mode 100755 dlls/netprofm/tests/topology-policy.sh
@@ -4581,10 +4583,10 @@ index 0000000..d9172d6
 +}
 diff --git a/dlls/netprofm/tests/nsi-faults.sh b/dlls/netprofm/tests/nsi-faults.sh
 new file mode 100755
-index 0000000..5901155
+index 0000000..3120390
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-faults.sh
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,211 @@
 +#!/bin/sh
 +set -eu
 +
@@ -4637,6 +4639,44 @@ index 0000000..5901155
 +        fi
 +        sleep 0.1
 +    done
++}
++
++multipath_route()
++{
++    # iproute2 limits its request buffer to 4096 bytes. Send a valid larger
++    # request directly, require a kernel ACK, and observe the real multicast.
++    /usr/bin/python3 - "$1" "$2" <<'PY'
++import socket
++import struct
++import sys
++
++action, count = sys.argv[1], int(sys.argv[2])
++def attribute(kind, value):
++    data = struct.pack('HH', len(value) + 4, kind) + value
++    return data + bytes((-len(data)) % 4)
++
++nexthops = b''.join(struct.pack('HBBi', 16, 0, i, socket.if_nametoindex('nlm0')) +
++                   attribute(5, socket.inet_aton('192.0.2.1')) for i in range(count))
++payload = struct.pack('BBBBBBBBI', socket.AF_INET, 0, 0, 0, 254, 3, 0, 1, 0)
++payload += attribute(9, nexthops)
++kind, flags = (24, 0x605) if action == 'add' else (25, 5)
++message = struct.pack('IHHII', len(payload) + 16, kind, flags, 1, 0) + payload
++with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0) as observer, \
++     socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0) as request:
++    observer.bind((0, 0x40))
++    observer.settimeout(5)
++    request.bind((0, 0))
++    request.settimeout(5)
++    request.sendto(message, (0, 0))
++    reply = request.recv(65536)
++    assert struct.unpack_from('H', reply, 4)[0] == 2
++    assert struct.unpack_from('i', reply, 16)[0] == 0, reply.hex()
++    packet = observer.recv(65536)
++    length, observed_kind = struct.unpack_from('IH', packet)
++    assert observed_kind == kind and length == len(packet)
++    assert (length > 4096) == (count == 254), (count, length)
++    print('real route %s: %d nexthops, %d notification bytes' % (action, count, length))
++PY
 +}
 +
 +${CC:-cc} -shared -fPIC -Wall -Wextra -o "$work_dir/loader.so" "$source_dir/nsi-backend.c" -ldl
@@ -4728,7 +4768,128 @@ index 0000000..5901155
 +        run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w
 +        [ "$result" -eq 0 ] || exit "$result"
 +    done
++    large_exe=$work_dir/large-$arch.exe
++    case "$test_exe" in *.so) large_exe=$large_exe.so;; esac
++    "$build_dir/tools/winegcc/winegcc" --wine-objdir "$build_dir" \
++        -D__WINESRC__ -D_MSVCR_VER=0 -I"$build_dir/include" \
++        -I"$root/include" -I"$root/include/msvcrt" \
++        -o "$large_exe" "$source_dir/nsi-large-route.c" \
++        -luuid -lnsi -lole32 -lwinecrt0 "$@" -lmsvcrt -lkernel32 -lntdll
++    # Both sides of PIPE_BUF, through the production backend and public APIs.
++    for nexthops in 253 254; do
++        rm -f "$work_dir/markers/"*
++        ip addr flush dev nlm0
++        ip addr add 192.0.2.2/24 dev nlm0
++        ip link set nlm0 up
++        echo "NSI multipath notifications: $arch $nexthops"
++        run_as_user env WINEPREFIX="$prefix" WINETEST_NSI_DIR="$work_dir/markers" \
++            DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work_dir/no-bus" \
++            "$build_dir/wine" "$large_exe" >"$work_dir/test.log" 2>&1 &
++        test_pid=$!
++        wait_marker ready
++        multipath_route add "$nexthops"
++        wait_marker online
++        multipath_route del "$nexthops"
++        result=0
++        wait "$test_pid" || result=$?
++        cat "$work_dir/test.log"
++        run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -k
++        run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w
++        [ "$result" -eq 0 ] || exit "$result"
++    done
 +done
+diff --git a/dlls/netprofm/tests/nsi-large-route.c b/dlls/netprofm/tests/nsi-large-route.c
+new file mode 100644
+index 0000000..48b036e
+--- /dev/null
++++ b/dlls/netprofm/tests/nsi-large-route.c
+@@ -0,0 +1,86 @@
++/* Real large-datagram NSI notifications and public NLM state transitions.
++ * Copyright 2026 Peter Min
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#define COBJMACROS
++#define STANDALONE
++#include <stdarg.h>
++#include "windef.h"
++#include "winbase.h"
++#include "ifdef.h"
++#include "netiodef.h"
++#include "objbase.h"
++#include "initguid.h"
++#include "netlistmgr.h"
++#include "wine/nsi.h"
++#include "wine/test.h"
++
++static const NPI_MODULEID ipv4_module =
++    {sizeof(NPI_MODULEID), MIT_GUID, {{0xeb004a00, 0x9b1a, 0x11d4, {0x91, 0x23, 0x00, 0x50, 0x04, 0x77, 0x59, 0xbc}}}};
++
++static void marker( const char *name )
++{
++    char directory[MAX_PATH], path[MAX_PATH];
++    HANDLE file;
++    GetEnvironmentVariableA( "WINETEST_NSI_DIR", directory, sizeof(directory) );
++    snprintf( path, sizeof(path), "%s/%s", directory, name );
++    file = CreateFileA( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    ok( file != INVALID_HANDLE_VALUE, "marker %s error %lu\n", name, GetLastError() );
++    if (file != INVALID_HANDLE_VALUE) CloseHandle( file );
++}
++
++static void check_connectivity( INetworkListManager *manager, NLM_CONNECTIVITY expected )
++{
++    ULONGLONG deadline = GetTickCount64() + 10000;
++    NLM_CONNECTIVITY value = 0;
++    HRESULT hr;
++    do
++    {
++        hr = INetworkListManager_GetConnectivity( manager, &value );
++        ok( hr == S_OK, "GetConnectivity %#lx\n", hr );
++        value &= NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV4_INTERNET;
++        if (value == expected) break;
++        Sleep( 50 );
++    } while (GetTickCount64() < deadline);
++    ok( value == expected, "connectivity %#x, expected %#x\n", value, expected );
++}
++
++START_TEST(nsi_large_route)
++{
++    INetworkListManager *manager;
++    OVERLAPPED overlapped = {0};
++    HANDLE handle;
++    HRESULT hr;
++    DWORD ret, bytes;
++    unsigned int i;
++
++    hr = CoInitializeEx( NULL, COINIT_MULTITHREADED );
++    ok( SUCCEEDED(hr), "CoInitializeEx %#lx\n", hr );
++    hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
++                           &IID_INetworkListManager, (void **)&manager );
++    ok( hr == S_OK, "CoCreateInstance %#lx\n", hr );
++    if (FAILED(hr)) goto done;
++    check_connectivity( manager, NLM_CONNECTIVITY_IPV4_LOCALNETWORK );
++    overlapped.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL );
++    ok( !!overlapped.hEvent, "CreateEventW %lu\n", GetLastError() );
++    if (!overlapped.hEvent) goto release;
++    for (i = 0; i < 2; i++)
++    {
++        ResetEvent( overlapped.hEvent );
++        ret = NsiRequestChangeNotification( 0, &ipv4_module, NSI_IP_FORWARD_TABLE, &overlapped, &handle );
++        ok( ret == ERROR_IO_PENDING, "subscribe %u: %lu\n", i, ret );
++        if (ret != ERROR_IO_PENDING) break;
++        marker( i ? "online" : "ready" );
++        ret = WaitForSingleObject( overlapped.hEvent, 10000 );
++        ok( ret == WAIT_OBJECT_0, "route %s notification timed out: %lu\n", i ? "deletion" : "addition", ret );
++        if (ret != WAIT_OBJECT_0) NsiCancelChangeNotification( &overlapped );
++        ret = GetOverlappedResult( handle, &overlapped, &bytes, TRUE );
++        ok( ret, "route %s completion failed: %lu\n", i ? "deletion" : "addition", GetLastError() );
++        check_connectivity( manager, i ? NLM_CONNECTIVITY_IPV4_LOCALNETWORK : NLM_CONNECTIVITY_IPV4_INTERNET );
++    }
++    CloseHandle( overlapped.hEvent );
++release:
++    INetworkListManager_Release( manager );
++done:
++    CoUninitialize();
++}
 diff --git a/dlls/netprofm/tests/reachability-network.sh b/dlls/netprofm/tests/reachability-network.sh
 new file mode 100755
 index 0000000..5b0c54d
@@ -6033,10 +6194,28 @@ index 158a39e..0216544 100644
  
      if (!ioctl( fd, SIOCGIFMTU, &req )) data->mtu = req.ifr_mtu;
 diff --git a/dlls/nsiproxy.sys/nsi.c b/dlls/nsiproxy.sys/nsi.c
-index 9e88a67..748796f 100644
+index 9e88a67..6649c4c 100644
 --- a/dlls/nsiproxy.sys/nsi.c
 +++ b/dlls/nsiproxy.sys/nsi.c
-@@ -207,7 +207,8 @@ static NTSTATUS poll_events(void)
+@@ -25,6 +25,7 @@
+ #include <stdarg.h>
+ #include <assert.h>
+ #include <errno.h>
++#include <stdlib.h>
+ #include <unistd.h>
+ #include <sys/socket.h>
+ #include <limits.h>
+@@ -190,7 +191,8 @@ static NTSTATUS add_notification( const NPI_MODULEID *module, UINT32 table )
+ static NTSTATUS poll_events(void)
+ {
+     static int netlink_fd = -1;
+-    char buffer[PIPE_BUF];
++    char initial_buffer[PIPE_BUF], *buffer = initial_buffer;
++    size_t buffer_size = sizeof(initial_buffer);
+     struct nlmsghdr *nlh;
+     NTSTATUS status;
+     int len;
+@@ -207,7 +209,8 @@ static NTSTATUS poll_events(void)
  
          memset( &addr, 0, sizeof(addr) );
          addr.nl_family = AF_NETLINK;
@@ -6046,25 +6225,56 @@ index 9e88a67..748796f 100644
          if (bind( netlink_fd, (struct sockaddr *)&addr, sizeof(addr) ) == -1)
          {
              close( netlink_fd );
-@@ -222,8 +223,10 @@ static NTSTATUS poll_events(void)
-         len = recv( netlink_fd, buffer, sizeof(buffer), 0 );
+@@ -219,12 +222,36 @@ static NTSTATUS poll_events(void)
+ 
+     while (1)
+     {
+-        len = recv( netlink_fd, buffer, sizeof(buffer), 0 );
++        /* Netlink datagrams can exceed PIPE_BUF, e.g. multipath routes.
++         * Peek the full size before consuming the packet; a truncated read
++         * otherwise silently discards the only notification of a change. */
++        len = recv( netlink_fd, buffer, buffer_size, MSG_PEEK | MSG_TRUNC );
          if (len <= 0)
          {
 -            if (errno == EINTR) continue;
 +            if (len == -1 && errno == EINTR) continue;
              ERR( "error receivng, len %d, errno %d.\n", len, errno );
-+            close( netlink_fd );
-+            netlink_fd = -1;
-             return STATUS_UNSUCCESSFUL;
+-            return STATUS_UNSUCCESSFUL;
++            status = STATUS_UNSUCCESSFUL;
++            goto failed;
++        }
++        if (len > buffer_size)
++        {
++            char *new_buffer = realloc( buffer == initial_buffer ? NULL : buffer, len );
++            if (!new_buffer)
++            {
++                status = STATUS_NO_MEMORY;
++                goto failed;
++            }
++            buffer = new_buffer;
++            buffer_size = len;
++        }
++        len = recv( netlink_fd, buffer, buffer_size, MSG_TRUNC );
++        if (len <= 0 || len > buffer_size)
++        {
++            if (len == -1 && errno == EINTR) continue;
++            ERR( "incomplete netlink datagram, len %d, buffer size %zu, errno %d.\n",
++                 len, buffer_size, errno );
++            status = STATUS_UNSUCCESSFUL;
++            goto failed;
          }
          for (nlh = (struct nlmsghdr *)buffer; NLMSG_OK(nlh, len); nlh = NLMSG_NEXT(nlh, len))
-@@ -243,6 +246,20 @@ static NTSTATUS poll_events(void)
+         {
+@@ -241,12 +268,33 @@ static NTSTATUS poll_events(void)
+                     WARN( "Unknown addrmsg->ifa_family %d.\n", addrmsg->ifa_family );
+                     continue;
                  }
-                 if ((status = add_notification( module, NSI_IP_UNICAST_TABLE))) return status;
-             }
+-                if ((status = add_notification( module, NSI_IP_UNICAST_TABLE))) return status;
++                if ((status = add_notification( module, NSI_IP_UNICAST_TABLE))) goto failed;
++            }
 +            else if (nlh->nlmsg_type == RTM_NEWLINK || nlh->nlmsg_type == RTM_DELLINK)
 +            {
-+                if ((status = add_notification( &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE ))) return status;
++                if ((status = add_notification( &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE ))) goto failed;
 +            }
 +            else if (nlh->nlmsg_type == RTM_NEWROUTE || nlh->nlmsg_type == RTM_DELROUTE)
 +            {
@@ -6074,12 +6284,24 @@ index 9e88a67..748796f 100644
 +                if (rtmsg->rtm_family == AF_INET)       module = &NPI_MS_IPV4_MODULEID;
 +                else if (rtmsg->rtm_family == AF_INET6) module = &NPI_MS_IPV6_MODULEID;
 +                else continue;
-+                if ((status = add_notification( module, NSI_IP_FORWARD_TABLE ))) return status;
-+            }
++                if ((status = add_notification( module, NSI_IP_FORWARD_TABLE ))) goto failed;
+             }
          }
          if (queued_notification_count) break;
      }
-@@ -284,10 +301,12 @@ static NTSTATUS poll_events(void)
+-    return STATUS_SUCCESS;
++    status = STATUS_SUCCESS;
++    goto done;
++failed:
++    close( netlink_fd );
++    netlink_fd = -1;
++done:
++    if (buffer != initial_buffer) free( buffer );
++    return status;
+ }
+ #elif defined(__APPLE__)
+ static NTSTATUS poll_events(void)
+@@ -284,10 +332,12 @@ static NTSTATUS poll_events(void)
          int len;
  
          len = recv( sock, &msg, sizeof(msg), 0 );
