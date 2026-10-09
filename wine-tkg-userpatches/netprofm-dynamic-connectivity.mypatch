@@ -1,4 +1,4 @@
-From 91ef4b316fa007e1e030d7f413797dbe782c61ee Mon Sep 17 00:00:00 2001
+From 4ae2a63257d49487b1b31c7b9b99c55eece83ebf Mon Sep 17 00:00:00 2001
 From: Woonggi Min <62207008+minpeter@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 19:00:58 +0900
 Subject: [PATCH] netprofm: Port reviewed dynamic connectivity and fault
@@ -29,23 +29,23 @@ Amp-Thread-ID: https://ampcode.com/threads/T-01a0fc5f-d85f-778a-8561-d4ea9af67f8
  dlls/netprofm/tests/ipv6-route-source.c       |  89 ++
  dlls/netprofm/tests/list.c                    | 805 ++++++++++++++++-
  dlls/netprofm/tests/monitor-faults.c          | 394 +++++++++
- dlls/netprofm/tests/nsi-backend.c             | 104 +++
- dlls/netprofm/tests/nsi-device.c              | 200 +++++
- dlls/netprofm/tests/nsi-faults.c              | 204 +++++
- dlls/netprofm/tests/nsi-faults.sh             | 211 +++++
- dlls/netprofm/tests/nsi-large-route.c         |  86 ++
+ dlls/netprofm/tests/nsi-backend.c             | 123 +++
+ dlls/netprofm/tests/nsi-device.c              | 207 +++++
+ dlls/netprofm/tests/nsi-faults.c              | 223 +++++
+ dlls/netprofm/tests/nsi-faults.sh             | 253 ++++++
+ dlls/netprofm/tests/nsi-large-route.c         |  97 ++
  dlls/netprofm/tests/reachability-network.sh   | 274 ++++++
  dlls/netprofm/tests/topology-backend.c        |  58 ++
  dlls/netprofm/tests/topology-policy.sh        |  83 ++
  dlls/netprofm/unixlib.c                       | 535 +++++++++++
  dlls/netprofm/unixlib.h                       |  66 ++
- dlls/nsiproxy.sys/device.c                    |  43 +-
+ dlls/nsiproxy.sys/device.c                    |  53 +-
  dlls/nsiproxy.sys/ip.c                        |  46 +-
  dlls/nsiproxy.sys/ndis.c                      |  35 +-
- dlls/nsiproxy.sys/nsi.c                       |  68 +-
+ dlls/nsiproxy.sys/nsi.c                       | 122 ++-
  include/netlistmgr.idl                        |  10 +
  include/wine/nsi.h                            |   5 +
- 33 files changed, 5235 insertions(+), 144 deletions(-)
+ 33 files changed, 5375 insertions(+), 166 deletions(-)
  create mode 100755 dlls/netprofm/tests/adversarial.sh
  create mode 100644 dlls/netprofm/tests/bus-stalls.c
  create mode 100644 dlls/netprofm/tests/bus-stalls.py
@@ -4057,10 +4057,10 @@ index 0000000..734dfc1
 +}
 diff --git a/dlls/netprofm/tests/nsi-backend.c b/dlls/netprofm/tests/nsi-backend.c
 new file mode 100644
-index 0000000..20b2471
+index 0000000..21da53f
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-backend.c
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,123 @@
 +/* Real NSI polling backend with faults at the Unix socket boundary.
 + * Copyright 2026 Peter Min
 + * SPDX-License-Identifier: LGPL-2.1-or-later
@@ -4102,7 +4102,6 @@ index 0000000..20b2471
 +    {
 +        if (!strcmp( getenv( "WINETEST_NSI_FAULT" ), "socket" ))
 +        {
-+            wait_fault();
 +            marker( "injected" );
 +            errno = EMFILE;
 +            return -1;
@@ -4113,12 +4112,31 @@ index 0000000..20b2471
 +    return socket( domain, type, protocol );
 +}
 +
++static int fault_bind( int fd, const struct sockaddr *address, socklen_t size )
++{
++    int ret;
++    if (fd == notification_fd)
++    {
++        if (!strcmp( getenv( "WINETEST_NSI_FAULT" ), "bind" ))
++        {
++            marker( "injected" );
++            errno = EADDRINUSE;
++            return -1;
++        }
++        if (!strcmp( getenv( "WINETEST_NSI_FAULT" ), "startup" )) wait_fault();
++    }
++    ret = bind( fd, address, size );
++    if (!ret && fd == notification_fd) marker( "listening" );
++    return ret;
++}
++
 +static ssize_t fault_recv( int fd, void *buffer, size_t len, int flags )
 +{
 +    if (fd == notification_fd)
 +    {
 +        marker( "polling" );
-+        if (strcmp( getenv( "WINETEST_NSI_FAULT" ), "control" ))
++        if (strcmp( getenv( "WINETEST_NSI_FAULT" ), "control" ) &&
++            strcmp( getenv( "WINETEST_NSI_FAULT" ), "startup" ))
 +        {
 +            wait_fault();
 +            marker( "injected" );
@@ -4140,6 +4158,7 @@ index 0000000..20b2471
 +}
 +
 +#define socket fault_socket
++#define bind fault_bind
 +#define recv fault_recv
 +#define close fault_close
 +#include "../../nsiproxy.sys/nsi.c"
@@ -4167,10 +4186,10 @@ index 0000000..20b2471
 +#endif
 diff --git a/dlls/netprofm/tests/nsi-device.c b/dlls/netprofm/tests/nsi-device.c
 new file mode 100644
-index 0000000..5d0673c
+index 0000000..d6a5400
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-device.c
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,207 @@
 +/* Deterministic cancellation/startup interleavings in the real device queue.
 + * Complements nsi-faults.c, which uses the real Unix backend and device host.
 + * Copyright 2026 Peter Min
@@ -4195,7 +4214,7 @@ index 0000000..5d0673c
 +
 +static HANDLE poll_gate, cancel_entered, cancel_gate;
 +static BOOL hold_cancel;
-+static NTSTATUS poll_status;
++static NTSTATUS poll_status, init_status;
 +static LONG completions, allocations;
 +
 +static NTSTATUS test_call( unsigned int code, void *args );
@@ -4266,6 +4285,7 @@ index 0000000..5d0673c
 +static NTSTATUS test_call( unsigned int code, void *args )
 +{
 +    struct nsi_get_notification_params *params = args;
++    if (code == nsi_init_notification) return init_status;
 +    WaitForSingleObject( poll_gate, INFINITE );
 +    params->module = NPI_MS_NDIS_MODULEID;
 +    params->table = NSI_NDIS_IFINFO_TABLE;
@@ -4352,15 +4372,21 @@ index 0000000..5d0673c
 +        CloseHandle( canceller );
 +        hold_cancel = FALSE;
 +    }
-+    /* The real DriverEntry takes the failed CreateThread branch. */
-+    notification_status = 0;
-+    status = DriverEntry( &driver, &path );
-+    ok( status == STATUS_SUCCESS, "driver initialization %#lx\n", status );
-+    init_request( &future );
-+    status = nsi_ioctl( NULL, &future.irp );
-+    ok( status == STATUS_NO_MEMORY && future.completed == 1, "thread creation failure %#lx/%ld\n", status, future.completed );
-+    ok( IsListEmpty( &notification_queue ), "startup failure queued a request\n" );
-+    ok( !allocations, "startup failure leaked %ld allocations\n", allocations );
++    /* Listener initialization and worker creation failures must reject later
++     * requests, while leaving the enumeration/ICMP device available. */
++    for (i = 0; i < 2; i++)
++    {
++        notification_status = 0;
++        init_status = i ? STATUS_SUCCESS : STATUS_NOT_IMPLEMENTED;
++        status = DriverEntry( &driver, &path );
++        ok( status == STATUS_SUCCESS, "driver initialization %#lx\n", status );
++        init_request( &future );
++        status = nsi_ioctl( NULL, &future.irp );
++        ok( status == (i ? STATUS_NO_MEMORY : STATUS_NOT_IMPLEMENTED) && future.completed == 1,
++            "startup failure %u: %#lx/%ld\n", i, status, future.completed );
++        ok( IsListEmpty( &notification_queue ), "startup failure queued a request\n" );
++        ok( !allocations, "startup failure leaked %ld allocations\n", allocations );
++    }
 +    notification_status = 0;
 +    init_request( &future );
 +    future.irp.Cancel = TRUE;
@@ -4373,10 +4399,10 @@ index 0000000..5d0673c
 +}
 diff --git a/dlls/netprofm/tests/nsi-faults.c b/dlls/netprofm/tests/nsi-faults.c
 new file mode 100644
-index 0000000..d9172d6
+index 0000000..893a5f8
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-faults.c
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,223 @@
 +/* Exercise real NSI subscriptions and the manager against a failed backend.
 + * Only the optional reachability provider is disabled in this manager copy.
 + * Copyright 2026 Peter Min
@@ -4483,10 +4509,30 @@ index 0000000..d9172d6
 +    GetEnvironmentVariableA( "WINETEST_NSI_DIR", directory, sizeof(directory) );
 +    GetEnvironmentVariableA( "WINETEST_NSI_FAULT", mode, sizeof(mode) );
 +    control = !strcmp( mode, "control" );
-+    expected_error = !strcmp( mode, "socket" ) ? ERROR_INVALID_FUNCTION : ERROR_GEN_FAILURE;
++    expected_error = ERROR_GEN_FAILURE;
 +    expected = !strcmp( mode, "retained" ) ?
 +        NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV6_INTERNET : NLM_CONNECTIVITY_DISCONNECTED;
 +    CoInitializeEx( NULL, COINIT_MULTITHREADED );
++    if (!strcmp( mode, "socket" ) || !strcmp( mode, "bind" ))
++    {
++        /* An initialization failure is reported before any client can queue
++         * an unserviceable subscription or publish a dynamic manager. */
++        hr = list_manager_create( (void **)&iface );
++        ok( hr == HRESULT_FROM_WIN32( ERROR_INVALID_FUNCTION ), "startup create %#lx\n", hr );
++        ok( !iface, "startup failure published a manager\n" );
++        for (i = 0; i < ARRAY_SIZE(pending); i++)
++        {
++            ret = NsiRequestChangeNotification( 0, &npi_ndis_module, NSI_NDIS_IFINFO_TABLE,
++                                                pending + i, handles + i );
++            ok( ret == ERROR_INVALID_FUNCTION, "startup subscription %u: %lu\n", i, ret );
++            if (ret == ERROR_IO_PENDING)
++            {
++                NsiCancelChangeNotification( pending + i );
++                GetOverlappedResult( handles[i], pending + i, &bytes, TRUE );
++            }
++        }
++        goto done;
++    }
 +    hr = list_manager_create( (void **)&iface );
 +    ok( hr == S_OK, "create %#lx\n", hr );
 +    if (FAILED(hr)) goto done;
@@ -4530,8 +4576,7 @@ index 0000000..d9172d6
 +    wait_marker( "changed" );
 +    ret = WaitForSingleObject( closed.hEvent, 10000 );
 +    ok( ret == WAIT_OBJECT_0, "closed file request stranded: %lu\n", ret );
-+    ok( (NTSTATUS)closed.Internal == (control ? STATUS_SUCCESS :
-+        !strcmp( mode, "socket" ) ? STATUS_NOT_IMPLEMENTED : STATUS_UNSUCCESSFUL),
++    ok( (NTSTATUS)closed.Internal == (control ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL),
 +        "closed file completion %#lx\n", (NTSTATUS)closed.Internal );
 +    CloseHandle( closed.hEvent );
 +    if (!control)
@@ -4583,10 +4628,10 @@ index 0000000..d9172d6
 +}
 diff --git a/dlls/netprofm/tests/nsi-faults.sh b/dlls/netprofm/tests/nsi-faults.sh
 new file mode 100755
-index 0000000..3120390
+index 0000000..46a8db1
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-faults.sh
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,253 @@
 +#!/bin/sh
 +set -eu
 +
@@ -4739,7 +4784,7 @@ index 0000000..3120390
 +    [ "$result" -eq 0 ] || exit "$result"
 +    run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -k
 +    run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w
-+    for mode in socket recv retained control; do
++    for mode in socket bind recv retained control; do
 +        rm -f "$work_dir/markers/"*
 +        ip addr flush dev nlm0
 +        ip addr add 192.0.2.2/24 dev nlm0
@@ -4752,18 +4797,22 @@ index 0000000..3120390
 +            LD_PRELOAD="$work_dir/loader.so" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work_dir/no-bus" \
 +            "$build_dir/wine" "$test_exe" >"$work_dir/test.log" 2>&1 &
 +        test_pid=$!
-+        wait_marker polling
-+        wait_marker ready
-+        ip link set nlm0 down
-+        # Cover both the legacy retained-address snapshot and no-address
-+        # disconnected snapshot; neither may claim to remain dynamic.
-+        [ "$mode" = retained ] || ip addr flush dev nlm0
-+        touch "$work_dir/markers/go" "$work_dir/markers/changed"
++        case "$mode" in
++            socket|bind) ;;
++            *)
++                wait_marker polling
++                wait_marker ready
++                ip link set nlm0 down
++                # Cover both retained-address and no-address snapshots;
++                # neither may claim to remain dynamic after failure.
++                [ "$mode" = retained ] || ip addr flush dev nlm0
++                touch "$work_dir/markers/go" "$work_dir/markers/changed";;
++        esac
 +        result=0
 +        wait "$test_pid" || result=$?
 +        cat "$work_dir/test.log"
 +        [ "$mode" = control ] || test -f "$work_dir/markers/injected"
-+        case "$mode" in recv|retained) test -f "$work_dir/markers/closed";; esac
++        case "$mode" in bind|recv|retained) test -f "$work_dir/markers/closed";; esac
 +        run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -k
 +        run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w
 +        [ "$result" -eq 0 ] || exit "$result"
@@ -4797,13 +4846,51 @@ index 0000000..3120390
 +        run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w
 +        [ "$result" -eq 0 ] || exit "$result"
 +    done
++    # Gate the real kernel bind. A dynamic manager must not be published early,
++    # and must initialize both with unchanged topology and with a route added
++    # during the gate. Neither case sends a wake-up event after binding.
++    for startup in 0 1; do
++        rm -f "$work_dir/markers/"*
++        ip addr flush dev nlm0
++        ip addr add 192.0.2.2/24 dev nlm0
++        ip link set nlm0 up
++        echo "NSI listener startup: $arch changed=$startup"
++        run_as_user env WINEPREFIX="$prefix" WINETEST_NSI_FAULT=startup \
++            WINETEST_NSI_STARTUP="$startup" WINETEST_NSI_DIR="$work_dir/markers" \
++            WINETEST_NSI_BACKEND="$work_dir/nsiproxy.so" LD_PRELOAD="$work_dir/loader.so" \
++            DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work_dir/no-bus" \
++            "$build_dir/wine" "$large_exe" >"$work_dir/test.log" 2>&1 &
++        test_pid=$!
++        wait_marker polling
++        attempt=0
++        while [ "$attempt" -lt 50 ]; do
++            if [ -f "$work_dir/markers/created" ]; then
++                cat "$work_dir/test.log"
++                echo "NLM factory published before kernel listener initialization" >&2
++                exit 1
++            fi
++            kill -0 "$test_pid" 2>/dev/null || { cat "$work_dir/test.log"; exit 1; }
++            attempt=$((attempt + 1))
++            sleep 0.1
++        done
++        [ "$startup" = 0 ] || ip route add default via 192.0.2.1 dev nlm0
++        touch "$work_dir/markers/go"
++        result=0
++        wait "$test_pid" || result=$?
++        cat "$work_dir/test.log"
++        test -f "$work_dir/markers/listening"
++        test -f "$work_dir/markers/created"
++        run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -k
++        run_as_user env WINEPREFIX="$prefix" "$build_dir/server/wineserver" -w
++        [ "$result" -eq 0 ] || exit "$result"
++    done
 +done
 diff --git a/dlls/netprofm/tests/nsi-large-route.c b/dlls/netprofm/tests/nsi-large-route.c
 new file mode 100644
-index 0000000..48b036e
+index 0000000..4f60683
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-large-route.c
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,97 @@
 +/* Real large-datagram NSI notifications and public NLM state transitions.
 + * Copyright 2026 Peter Min
 + * SPDX-License-Identifier: LGPL-2.1-or-later
@@ -4859,6 +4946,7 @@ index 0000000..48b036e
 +    HRESULT hr;
 +    DWORD ret, bytes;
 +    unsigned int i;
++    char startup[2];
 +
 +    hr = CoInitializeEx( NULL, COINIT_MULTITHREADED );
 +    ok( SUCCEEDED(hr), "CoInitializeEx %#lx\n", hr );
@@ -4866,6 +4954,16 @@ index 0000000..48b036e
 +                           &IID_INetworkListManager, (void **)&manager );
 +    ok( hr == S_OK, "CoCreateInstance %#lx\n", hr );
 +    if (FAILED(hr)) goto done;
++    if (GetEnvironmentVariableA( "WINETEST_NSI_STARTUP", startup, sizeof(startup) ))
++    {
++        /* The harness changes topology while the kernel bind is gated. The
++         * factory must not publish its snapshot until the listener is ready. */
++        marker( "created" );
++        check_connectivity( manager, startup[0] == '0' ? NLM_CONNECTIVITY_IPV4_LOCALNETWORK :
++                                                       NLM_CONNECTIVITY_IPV4_INTERNET );
++        INetworkListManager_Release( manager );
++        goto done;
++    }
 +    check_connectivity( manager, NLM_CONNECTIVITY_IPV4_LOCALNETWORK );
 +    overlapped.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL );
 +    ok( !!overlapped.hEvent, "CreateEventW %lu\n", GetLastError() );
@@ -5937,7 +6035,7 @@ index 0000000..39ac542
 +
 +#endif /* __WINE_NETPROFM_UNIXLIB_H */
 diff --git a/dlls/nsiproxy.sys/device.c b/dlls/nsiproxy.sys/device.c
-index 28e6997..e2402de 100644
+index 28e6997..50e3500 100644
 --- a/dlls/nsiproxy.sys/device.c
 +++ b/dlls/nsiproxy.sys/device.c
 @@ -49,6 +49,8 @@ DECLARE_CRITICAL_SECTION( nsiproxy_cs );
@@ -5949,7 +6047,15 @@ index 28e6997..e2402de 100644
  
  struct notification_data
  {
-@@ -394,6 +396,13 @@ static NTSTATUS nsiproxy_change_notification( IRP *irp )
+@@ -70,6 +72,7 @@ enum unix_calls
+     nsi_get_all_parameters_ex,
+     nsi_get_parameter_ex,
+     nsi_get_notification,
++    nsi_init_notification,
+ };
+ 
+ static NTSTATUS nsiproxy_enumerate_all( IRP *irp )
+@@ -394,6 +397,13 @@ static NTSTATUS nsiproxy_change_notification( IRP *irp )
      /* FIXME: validate module and table. */
  
      EnterCriticalSection( &nsiproxy_cs );
@@ -5963,7 +6069,7 @@ index 28e6997..e2402de 100644
      IoSetCancelRoutine( irp, change_notification_cancel );
      if (irp->Cancel && IoSetCancelRoutine( irp, NULL ))
      {
-@@ -480,38 +489,44 @@ static int add_device( DRIVER_OBJECT *driver )
+@@ -480,38 +490,44 @@ static int add_device( DRIVER_OBJECT *driver )
  static DWORD WINAPI notification_thread_proc( void *arg )
  {
      struct nsi_get_notification_params params;
@@ -6019,17 +6125,25 @@ index 28e6997..e2402de 100644
  
      WARN( "nsi_get_notification failed, status %#lx.\n", status );
      return 0;
-@@ -529,10 +544,14 @@ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
+@@ -529,10 +545,21 @@ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
  
      driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = nsi_ioctl;
  
 +    EnterCriticalSection( &nsiproxy_cs );
++    /* A queued subscription must imply that kernel notifications are already
++     * being captured. Otherwise a client's initial snapshot can race the
++     * detached worker's first bind and miss the only topology change. */
++    notification_status = nsiproxy_call( nsi_init_notification, NULL );
      add_device( driver );
  
-     thread = CreateThread( NULL, 0, notification_thread_proc, NULL, 0, NULL );
+-    thread = CreateThread( NULL, 0, notification_thread_proc, NULL, 0, NULL );
 -    CloseHandle( thread );
-+    if (thread) CloseHandle( thread );
-+    else notification_status = STATUS_NO_MEMORY;
++    if (!notification_status)
++    {
++        thread = CreateThread( NULL, 0, notification_thread_proc, NULL, 0, NULL );
++        if (thread) CloseHandle( thread );
++        else notification_status = STATUS_NO_MEMORY;
++    }
 +    LeaveCriticalSection( &nsiproxy_cs );
 +
      thread = CreateThread( NULL, 0, icmp_listen_thread_proc, NULL, 0, NULL );
@@ -6194,7 +6308,7 @@ index 158a39e..0216544 100644
  
      if (!ioctl( fd, SIOCGIFMTU, &req )) data->mtu = req.ifr_mtu;
 diff --git a/dlls/nsiproxy.sys/nsi.c b/dlls/nsiproxy.sys/nsi.c
-index 9e88a67..6649c4c 100644
+index 9e88a67..cac8388 100644
 --- a/dlls/nsiproxy.sys/nsi.c
 +++ b/dlls/nsiproxy.sys/nsi.c
 @@ -25,6 +25,7 @@
@@ -6205,27 +6319,80 @@ index 9e88a67..6649c4c 100644
  #include <unistd.h>
  #include <sys/socket.h>
  #include <limits.h>
-@@ -190,7 +191,8 @@ static NTSTATUS add_notification( const NPI_MODULEID *module, UINT32 table )
+@@ -160,6 +161,39 @@ static NTSTATUS unix_nsi_get_parameter_ex( void *args )
+     return nsi_get_parameter_ex( params );
+ }
+ 
++/* Driver startup must subscribe to kernel multicast before clients can queue
++ * notifications and reconcile their initial snapshots. No event is required
++ * to complete initialization. Other platforms keep their existing lazy setup. */
++#ifdef HAVE_LINUX_RTNETLINK_H
++static int netlink_fd = -1;
++#endif
++
++static NTSTATUS unix_nsi_init_notification( void *args )
++{
++#ifdef HAVE_LINUX_RTNETLINK_H
++    struct sockaddr_nl addr;
++
++    if (netlink_fd != -1) return STATUS_SUCCESS;
++    if ((netlink_fd = socket( PF_NETLINK, SOCK_RAW, NETLINK_ROUTE )) == -1)
++    {
++        ERR( "netlink socket creation failed, errno %d.\n", errno );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    memset( &addr, 0, sizeof(addr) );
++    addr.nl_family = AF_NETLINK;
++    addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR |
++                     RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE;
++    if (bind( netlink_fd, (struct sockaddr *)&addr, sizeof(addr) ) == -1)
++    {
++        close( netlink_fd );
++        netlink_fd = -1;
++        ERR( "bind failed, errno %d.\n", errno );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++#endif
++    return STATUS_SUCCESS;
++}
++
+ #if defined(HAVE_LINUX_RTNETLINK_H) || defined(__APPLE__)
+ static struct
+ {
+@@ -189,42 +223,46 @@ static NTSTATUS add_notification( const NPI_MODULEID *module, UINT32 table )
+ #if defined(HAVE_LINUX_RTNETLINK_H)
  static NTSTATUS poll_events(void)
  {
-     static int netlink_fd = -1;
+-    static int netlink_fd = -1;
 -    char buffer[PIPE_BUF];
 +    char initial_buffer[PIPE_BUF], *buffer = initial_buffer;
 +    size_t buffer_size = sizeof(initial_buffer);
      struct nlmsghdr *nlh;
      NTSTATUS status;
      int len;
-@@ -207,7 +209,8 @@ static NTSTATUS poll_events(void)
  
-         memset( &addr, 0, sizeof(addr) );
-         addr.nl_family = AF_NETLINK;
+-    if (netlink_fd == -1)
+-    {
+-        struct sockaddr_nl addr;
+-
+-        if ((netlink_fd = socket( PF_NETLINK, SOCK_RAW, NETLINK_ROUTE )) == -1)
+-        {
+-            ERR( "netlink socket creation failed, errno %d.\n", errno );
+-            return STATUS_NOT_IMPLEMENTED;
+-        }
+-
+-        memset( &addr, 0, sizeof(addr) );
+-        addr.nl_family = AF_NETLINK;
 -        addr.nl_groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
-+        addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR |
-+                         RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE;
-         if (bind( netlink_fd, (struct sockaddr *)&addr, sizeof(addr) ) == -1)
-         {
-             close( netlink_fd );
-@@ -219,12 +222,36 @@ static NTSTATUS poll_events(void)
+-        if (bind( netlink_fd, (struct sockaddr *)&addr, sizeof(addr) ) == -1)
+-        {
+-            close( netlink_fd );
+-            netlink_fd = -1;
+-            ERR( "bind failed, errno %d.\n", errno );
+-            return STATUS_NOT_IMPLEMENTED;
+-        }
+-    }
++    if ((status = unix_nsi_init_notification( NULL ))) return status;
  
      while (1)
      {
@@ -6265,7 +6432,7 @@ index 9e88a67..6649c4c 100644
          }
          for (nlh = (struct nlmsghdr *)buffer; NLMSG_OK(nlh, len); nlh = NLMSG_NEXT(nlh, len))
          {
-@@ -241,12 +268,33 @@ static NTSTATUS poll_events(void)
+@@ -241,12 +279,33 @@ static NTSTATUS poll_events(void)
                      WARN( "Unknown addrmsg->ifa_family %d.\n", addrmsg->ifa_family );
                      continue;
                  }
@@ -6301,7 +6468,7 @@ index 9e88a67..6649c4c 100644
  }
  #elif defined(__APPLE__)
  static NTSTATUS poll_events(void)
-@@ -284,10 +332,12 @@ static NTSTATUS poll_events(void)
+@@ -284,10 +343,12 @@ static NTSTATUS poll_events(void)
          int len;
  
          len = recv( sock, &msg, sizeof(msg), 0 );
@@ -6316,6 +6483,12 @@ index 9e88a67..6649c4c 100644
              return STATUS_UNSUCCESSFUL;
          }
  
+@@ -351,4 +412,5 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     unix_nsi_get_all_parameters_ex,
+     unix_nsi_get_parameter_ex,
+     unix_nsi_get_notification,
++    unix_nsi_init_notification,
+ };
 diff --git a/include/netlistmgr.idl b/include/netlistmgr.idl
 index d12b4a5..c2b2219 100644
 --- a/include/netlistmgr.idl
@@ -6357,3 +6530,6 @@ index 5028bbf..25626a5 100644
  struct nsi_ip_cmpt_rw
  {
      UINT not_forwarding;
+-- 
+2.55.0
+
