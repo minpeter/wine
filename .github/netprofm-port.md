@@ -78,9 +78,29 @@ native execution of the actual provider exercised silent AUTH, a saturated
 accept queue, and stalled Hello/AddMatch/GetNameOwner/GetAll: initial/reconnect
 invocations returned within approximately one second and teardown returned
 immediately. Adapted malformed-message checks use the real sd-bus encoder and
-reader. Final composed-runtime/COM regression and workstation replacement
-results for this change are pending; the preceding runtime results do not
-establish those results.
+reader: 1,387 checks passed on each architecture, along with ordinary tests and
+all six existing fixture families in the complete private 11.0-10 runtime.
+The expanded public COM fixture passed six stall phases (52 assertions each)
+and OFFLINE-to-ONLINE plus stalled-reconnect release (20 assertions), with every
+wire target confirmed on both architectures. No failures or skips were hidden.
+
+The complete 11.0-28 workstation candidate replaced only the two `netprofm.so`
+files. All other 4,553 regular files and 16 symlinks matched the prior runner.
+On both architectures it passed the same six public COM stall phases and
+recovery/release control, ordinary NLM/NSI/IP Helper (87/1,807/1,111), all four
+IPv6 source modes, and native Bottles topology/NM (200/136), with zero failures
+or skips and inherited TODOs retained. Maximum observed COM creation was
+1,033 ms (x64) / 1,031 ms (i386), release 758 / 744 ms, and GetConnectivity 0 ms.
+This workstation run used the exact compiled standalone PE and Python harness;
+the exact build-and-run shell fixture passed separately on the retained stable
+runtime. The full wrapper was not run in partial module trees; syntax, path
+guards and shared-tool resolution passed.
+
+After these checks, the workstation selected the separately installed candidate.
+The application's actual loader, NLM PE/Unix library and NSI driver mappings
+were verified, along with visible compositor windows. Only its runner selection
+changed; the prior runner and a stopped-prefix backup were retained. No live
+system-bus failure or authenticated application function was exercised.
 
 These are composed-runtime checks, **not a fresh full current patch-stack or
 dual-architecture PGO release-build pass**. Full current-stack compilation and
@@ -123,5 +143,8 @@ the affected manager falls back to a snapshot, not recovered monitoring.
 Provider reconnect tests do not prove whole-Wine device-host/system-bus
 recovery. Inherited policy-routing limitations remain. Native macOS/BSD,
 physical outage and real suspend/hibernate restoration are unverified.
+The provider budget bounds protocol waits, not loader/filesystem stalls,
+OS scheduling or arbitrary application COM callbacks. Linux needs an available
+sd-bus runtime for the optional provider; non-Linux retains topology fallback.
 GUI wheel/focus fixtures and empty-login rendering do not validate authenticated
 KakaoTalk chat scrolling, message delivery or multimedia.
