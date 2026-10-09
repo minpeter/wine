@@ -7,9 +7,10 @@ unchanged. It adds the NLM/required NSI patch and a focused test wrapper.
 
 AI-assisted implementation and port using Amp, authored by Woonggi Min.
 Existing copyright/LGPL notices and prerequisite attribution to Hans Leidekker
-and Paul Gofman are retained. The patch is identical to the reviewed
-`minpeter/wine:port/soda-11.0-10-nlm` payload, SHA256
-`946abf98ab06a2541321d72e456f1b057d50d5d69a8ec8290a3491bced41d6d4`.
+and Paul Gofman are retained. The patch extends the reviewed
+`minpeter/wine:port/soda-11.0-10-nlm` payload with strict IPv6 stream-error
+handling and regression coverage. Its SHA256 is
+`c4ead8734afaf27279a6fe8214ae3907f9e85f1ac0ec9a3fb7f3d0e1db09bb29`.
 It has not been accepted upstream.
 
 ## Behavior
@@ -22,14 +23,15 @@ It has not been accepted upstream.
 - COM event sinks use apartment-safe GIT dispatch. Startup reconciles state
   after all subscriptions are armed; backend failure completes pending/future
   requests and downgrades monitoring rather than stranding subscriptions.
-- Public IPv6 NSI enumeration preserves successful empty results on unsupported
-  backends. A private strict selector is used only for NLM enumeration.
+- Public IPv6 NSI enumeration preserves its partial/empty results on source
+  failure. A private strict selector rejects open and stream-read failures for
+  NLM, keeping unavailable enumeration distinct from a valid empty snapshot.
 - Existing public NSI layouts, netprofm exports, Valve prefer-native behavior
   and independent ICMP/device handling are preserved.
 
 ## Validation and submission status
 
-The identical patch was compiled for x64 and traditional i386 against the
+The preceding payload was compiled for x64 and traditional i386 against the
 official Soda 11.0-10 base, then tested in its complete official runtime with
 only the paired NLM/NSI modules replaced. Ordinary NLM/NSI/IP Helper, dynamic
 topology, topology policy, IPv6 availability, malformed D-Bus, backend failure
@@ -38,7 +40,16 @@ Native Bottles clean/upgraded-prefix NLM, typelib registration and isolated
 network fixtures also passed on both architectures. Expected TODOs and
 environmental IPv6 skips remain.
 
-Those results are prior-base evidence, **not a build/runtime pass for this
+The stream-error fix was checked with freshly rebuilt NSI Unix modules and NLM
+test PEs on both architectures: all four source modes passed, including public
+partial-row preservation. The original x64 backend failed the new read-error
+and partial-read-error cases. Ordinary NLM/NSI/IP Helper and all six network
+fixture families passed with zero failures/skips. The exact updated wrapper
+also passed on the complete retained x64 reference build (legacy CROSS flags);
+i386 used the genuine paired-module configuration and complete private official
+11.0-10 runtime, not a full-tree rebuild or an i386 wrapper execution.
+
+These results are prior-base evidence, **not a build/runtime pass for this
 latest-Soda branch**. Full current patch-stack preparation, compilation and
 runtime QA remain pending before submission. There is no full clean
 dual-architecture release-build claim. No binary runner is included here.
@@ -54,8 +65,12 @@ The wrapper, source, build and new log directory must resolve outside `/tmp`:
 the wrapper replaces `/tmp` with an isolated fixture workspace. Symlinks into
 `/tmp` are rejected before logs are created or privileged commands run. Use a
 checkout/build under your home directory and place logs there as well.
+For split-i386 builds, relative `wine64dir` values are resolved against the
+32-bit build directory, independently of the wrapper's working directory.
 Run `.github/tests/check-netprofm-paths.sh` for the unprivileged path-validation
-regression check; it does not run Wine or the network fixtures.
+and shared-tool resolution checks; their minimal build stand-ins do not run Wine
+or real network fixtures. The real IPv6 availability fixture covers open failure,
+successful emptiness, immediate read failure and failure after a valid route row.
 
 The inherited Soda workflow discovers the new `.mypatch` automatically. No CI
 or release workflow was triggered or changed to prepare this local branch.

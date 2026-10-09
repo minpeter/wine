@@ -1,14 +1,15 @@
-From 00c52fe7ff81792e76de6ac2a2c88177e1a38918 Mon Sep 17 00:00:00 2001
+From 74faa23286056655a5e06c0bdba374f2f637af73 Mon Sep 17 00:00:00 2001
 From: Woonggi Min <62207008+minpeter@users.noreply.github.com>
-Date: Fri, 9 Oct 2026 00:14:01 +0900
+Date: Fri, 9 Oct 2026 16:38:54 +0900
 Subject: [PATCH] netprofm: Port reviewed dynamic connectivity and fault
  regressions to Soda.
 
 AI-assisted implementation and port using Amp, reviewed series 455e3509b98a6919fd4ad1def4803e08c41c03b2..b82c41eca5ffd18a198afe008d2dc9f6fc53d453.
 Includes prerequisite IPv6 and loopback work by Hans Leidekker and Paul Gofman. Retains Valve prefer-native and ICMP behavior.
-Fixtures honor CC for split-i386 Unix helpers and select only built PE architectures; production policy is unchanged.
+Fixtures honor CC for split-i386 Unix helpers and select only built PE architectures. Strict IPv6 stream errors preserve the NLM fallback without changing public partial/empty enumeration.
 
 Co-authored-by: Amp <amp@ampcode.com>
+Amp-Thread-ID: https://ampcode.com/threads/T-01a0fc5f-d85f-778a-8561-d4ea9af67f80
 ---
  dlls/netprofm/Makefile.in                     |   8 +-
  dlls/netprofm/list.c                          | 831 ++++++++++++++++--
@@ -21,8 +22,8 @@ Co-authored-by: Amp <amp@ampcode.com>
  dlls/netprofm/tests/dynamic-network.sh        | 138 +++
  dlls/netprofm/tests/fake-networkmanager.py    |  72 ++
  .../netprofm/tests/ipv6-route-availability.sh |  84 ++
- dlls/netprofm/tests/ipv6-route-source.c       |  53 ++
- dlls/netprofm/tests/list.c                    | 804 ++++++++++++++++-
+ dlls/netprofm/tests/ipv6-route-source.c       |  89 ++
+ dlls/netprofm/tests/list.c                    | 805 ++++++++++++++++-
  dlls/netprofm/tests/monitor-faults.c          | 394 +++++++++
  dlls/netprofm/tests/nsi-backend.c             | 104 +++
  dlls/netprofm/tests/nsi-device.c              | 200 +++++
@@ -34,12 +35,12 @@ Co-authored-by: Amp <amp@ampcode.com>
  dlls/netprofm/unixlib.c                       | 520 +++++++++++
  dlls/netprofm/unixlib.h                       |  66 ++
  dlls/nsiproxy.sys/device.c                    |  43 +-
- dlls/nsiproxy.sys/ip.c                        |  38 +-
+ dlls/nsiproxy.sys/ip.c                        |  46 +-
  dlls/nsiproxy.sys/ndis.c                      |  35 +-
  dlls/nsiproxy.sys/nsi.c                       |  27 +-
  include/netlistmgr.idl                        |  10 +
  include/wine/nsi.h                            |   5 +
- 29 files changed, 4494 insertions(+), 139 deletions(-)
+ 29 files changed, 4539 insertions(+), 139 deletions(-)
  create mode 100755 dlls/netprofm/tests/adversarial.sh
  create mode 100644 dlls/netprofm/tests/dbus-malformed.c
  create mode 100755 dlls/netprofm/tests/dynamic-network.sh
@@ -58,7 +59,7 @@ Co-authored-by: Amp <amp@ampcode.com>
  create mode 100644 dlls/netprofm/unixlib.h
 
 diff --git a/dlls/netprofm/Makefile.in b/dlls/netprofm/Makefile.in
-index 46af13bb74c..b6e684dbaf4 100644
+index 46af13b..b6e684d 100644
 --- a/dlls/netprofm/Makefile.in
 +++ b/dlls/netprofm/Makefile.in
 @@ -1,9 +1,13 @@
@@ -78,7 +79,7 @@ index 46af13bb74c..b6e684dbaf4 100644
 +	netprofm.idl \
 +	unixlib.c
 diff --git a/dlls/netprofm/list.c b/dlls/netprofm/list.c
-index af40dc0ac91..b1621149f42 100644
+index af40dc0..b162114 100644
 --- a/dlls/netprofm/list.c
 +++ b/dlls/netprofm/list.c
 @@ -20,6 +20,7 @@
@@ -547,10 +548,10 @@ index af40dc0ac91..b1621149f42 100644
      {
 -        struct network *network, *next_network;
 -        struct connection *connection, *next_connection;
--
--        TRACE( "destroying %p\n", mgr );
 +        BOOL destroy_owner = !InterlockedCompareExchange( &mgr->destroy_pending, TRUE, FALSE );
  
+-        TRACE( "destroying %p\n", mgr );
+-
 -        connection_point_release( &mgr->events_cp );
 -        connection_point_release( &mgr->conn_mgr_cp );
 -        connection_point_release( &mgr->cost_mgr_cp );
@@ -1367,7 +1368,7 @@ index af40dc0ac91..b1621149f42 100644
      TRACE( "returning iface %p\n", *obj );
      return S_OK;
 diff --git a/dlls/netprofm/main.c b/dlls/netprofm/main.c
-index dc925049a31..d3df72a055d 100644
+index dc92504..d3df72a 100644
 --- a/dlls/netprofm/main.c
 +++ b/dlls/netprofm/main.c
 @@ -25,6 +25,7 @@
@@ -1396,7 +1397,7 @@ index dc925049a31..d3df72a055d 100644
   *      DllGetClassObject (NETPROFM.@)
   */
 diff --git a/dlls/netprofm/netprofm.idl b/dlls/netprofm/netprofm.idl
-index 31a45654718..e26d38b76c3 100644
+index 31a4565..e26d38b 100644
 --- a/dlls/netprofm/netprofm.idl
 +++ b/dlls/netprofm/netprofm.idl
 @@ -18,6 +18,6 @@
@@ -1408,7 +1409,7 @@ index 31a45654718..e26d38b76c3 100644
  
  #include "netlistmgr.idl"
 diff --git a/dlls/netprofm/netprofm_private.h b/dlls/netprofm/netprofm_private.h
-index 86da00d4ee6..9eb2ed907ec 100644
+index 86da00d..9eb2ed9 100644
 --- a/dlls/netprofm/netprofm_private.h
 +++ b/dlls/netprofm/netprofm_private.h
 @@ -16,4 +16,16 @@
@@ -1430,7 +1431,7 @@ index 86da00d4ee6..9eb2ed907ec 100644
 +
 +HRESULT list_manager_create( void ** );
 diff --git a/dlls/netprofm/tests/Makefile.in b/dlls/netprofm/tests/Makefile.in
-index 3dd8aed9e1e..b618aa2efa8 100644
+index 3dd8aed..b618aa2 100644
 --- a/dlls/netprofm/tests/Makefile.in
 +++ b/dlls/netprofm/tests/Makefile.in
 @@ -1,5 +1,5 @@
@@ -1442,7 +1443,7 @@ index 3dd8aed9e1e..b618aa2efa8 100644
  	list.c
 diff --git a/dlls/netprofm/tests/adversarial.sh b/dlls/netprofm/tests/adversarial.sh
 new file mode 100755
-index 00000000000..a89e7586b68
+index 0000000..a89e758
 --- /dev/null
 +++ b/dlls/netprofm/tests/adversarial.sh
 @@ -0,0 +1,105 @@
@@ -1553,7 +1554,7 @@ index 00000000000..a89e7586b68
 +done
 diff --git a/dlls/netprofm/tests/dbus-malformed.c b/dlls/netprofm/tests/dbus-malformed.c
 new file mode 100644
-index 00000000000..1acc6535466
+index 0000000..1acc653
 --- /dev/null
 +++ b/dlls/netprofm/tests/dbus-malformed.c
 @@ -0,0 +1,304 @@
@@ -1863,7 +1864,7 @@ index 00000000000..1acc6535466
 +#endif
 diff --git a/dlls/netprofm/tests/dynamic-network.sh b/dlls/netprofm/tests/dynamic-network.sh
 new file mode 100755
-index 00000000000..09aa9881495
+index 0000000..09aa988
 --- /dev/null
 +++ b/dlls/netprofm/tests/dynamic-network.sh
 @@ -0,0 +1,138 @@
@@ -2007,7 +2008,7 @@ index 00000000000..09aa9881495
 +cat "$log"
 diff --git a/dlls/netprofm/tests/fake-networkmanager.py b/dlls/netprofm/tests/fake-networkmanager.py
 new file mode 100755
-index 00000000000..3ccb1d5332f
+index 0000000..3ccb1d5
 --- /dev/null
 +++ b/dlls/netprofm/tests/fake-networkmanager.py
 @@ -0,0 +1,72 @@
@@ -2085,7 +2086,7 @@ index 00000000000..3ccb1d5332f
 +    main()
 diff --git a/dlls/netprofm/tests/ipv6-route-availability.sh b/dlls/netprofm/tests/ipv6-route-availability.sh
 new file mode 100755
-index 00000000000..bfe6bb59ef3
+index 0000000..8a75be4
 --- /dev/null
 +++ b/dlls/netprofm/tests/ipv6-route-availability.sh
 @@ -0,0 +1,84 @@
@@ -2153,7 +2154,7 @@ index 00000000000..bfe6bb59ef3
 +    [ -f "$test_exe" ] || continue
 +    found=true
 +    label=$(basename "$(dirname "$test_exe")")
-+    for mode in unavailable empty; do
++    for mode in unavailable empty read-error partial-read-error; do
 +        mkdir "$prefix"
 +        if [ -n "$run_uid" ]; then chown "$run_uid:$run_gid" "$prefix"; fi
 +        echo "IPv6 route availability: $label $mode"
@@ -2175,10 +2176,10 @@ index 00000000000..bfe6bb59ef3
 +fi
 diff --git a/dlls/netprofm/tests/ipv6-route-source.c b/dlls/netprofm/tests/ipv6-route-source.c
 new file mode 100644
-index 00000000000..77f87bdbf67
+index 0000000..fbfef6a
 --- /dev/null
 +++ b/dlls/netprofm/tests/ipv6-route-source.c
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,89 @@
 +/*
 + * IPv6 route-source fault injection for the netprofm integration tests.
 + *
@@ -2206,6 +2207,32 @@ index 00000000000..77f87bdbf67
 +#include <stdlib.h>
 +#include <string.h>
 +
++static ssize_t read_route_source( void *cookie, char *buf, size_t size )
++{
++    static const char route[] = "20010db8000000000000000000000000 40 "
++        "00000000000000000000000000000000 00 00000000000000000000000000000000 "
++        "00000100 00000000 00000000 00000001 nlm0\n";
++    size_t *offset = cookie, count;
++
++    if (!strcmp( getenv( "WINETEST_NETPROFM_IPV6_ROUTES" ), "partial-read-error" ) &&
++        *offset < sizeof(route) - 1)
++    {
++        count = sizeof(route) - 1 - *offset;
++        if (count > size) count = size;
++        memcpy( buf, route + *offset, count );
++        *offset += count;
++        return count;
++    }
++    errno = EIO;
++    return -1;
++}
++
++static int close_route_source( void *cookie )
++{
++    free( cookie );
++    return 0;
++}
++
 +static FILE *open_route_source( const char *func, const char *path, const char *mode )
 +{
 +    FILE *(*open_file)( const char *, const char * ) = dlsym( RTLD_NEXT, func );
@@ -2217,6 +2244,16 @@ index 00000000000..77f87bdbf67
 +        {
 +            errno = ENOENT;
 +            return NULL;
++        }
++        if (!strcmp( state, "read-error" ) || !strcmp( state, "partial-read-error" ))
++        {
++            cookie_io_functions_t funcs = {.read = read_route_source, .close = close_route_source};
++            size_t *offset = calloc( 1, sizeof(*offset) );
++            FILE *fp;
++
++            if (!offset) return NULL;
++            if (!(fp = fopencookie( offset, "r", funcs ))) free( offset );
++            return fp;
 +        }
 +        if (!strcmp( state, "empty" )) path = "/dev/null";
 +    }
@@ -2233,7 +2270,7 @@ index 00000000000..77f87bdbf67
 +    return open_route_source( "fopen64", path, mode );
 +}
 diff --git a/dlls/netprofm/tests/list.c b/dlls/netprofm/tests/list.c
-index 12a54477f66..902073f5959 100644
+index 12a5447..188f1a2 100644
 --- a/dlls/netprofm/tests/list.c
 +++ b/dlls/netprofm/tests/list.c
 @@ -17,14 +17,53 @@
@@ -2427,7 +2464,7 @@ index 12a54477f66..902073f5959 100644
  
      hr = IConnectionPointContainer_FindConnectionPoint( cpc, &IID_INetworkListManagerEvents, &pt2 );
      ok( hr == S_OK, "got %08lx\n", hr );
-@@ -460,9 +577,670 @@ static void test_INetworkListManager( void )
+@@ -460,9 +577,671 @@ static void test_INetworkListManager( void )
      ok( !ref1, "ref = %lu\n", ref1 );
  }
  
@@ -2888,10 +2925,11 @@ index 12a54477f66..902073f5959 100644
 +    }
 +}
 +
-+static void test_ipv6_route_availability( BOOL unavailable )
++static void test_ipv6_route_availability( const char *mode )
 +{
 +    static const ULONG families[] = {AF_UNSPEC, AF_INET6};
 +    const ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_DNS_SERVER;
++    const BOOL unavailable = strcmp( mode, "empty" ), partial = !strcmp( mode, "partial-read-error" );
 +    IP_ADAPTER_ADDRESSES *addresses, *adapter;
 +    IP_ADAPTER_UNICAST_ADDRESS *address;
 +    struct nsi_ipv6_forward_key *keys;
@@ -2903,7 +2941,7 @@ index 12a54477f66..902073f5959 100644
 +    ULONG size, i, j;
 +    HRESULT hr;
 +
-+    trace( "IPv6 route source %s\n", unavailable ? "unavailable" : "empty" );
++    trace( "IPv6 route source %s\n", mode );
 +    count = 0;
 +    err = NsiEnumerateObjectsAllParameters( 1, 0, &NPI_MS_IPV6_MODULEID,
 +                                            NSI_WINE_IPV6_FORWARD_TABLE_STRICT,
@@ -2915,13 +2953,13 @@ index 12a54477f66..902073f5959 100644
 +    count = 0;
 +    err = NsiEnumerateObjectsAllParameters( 1, 0, &NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE,
 +                                            NULL, 0, NULL, 0, NULL, 0, NULL, 0, &count );
-+    ok( !err && !count, "public count query returned %lu, count %lu\n", err, count );
++    ok( !err && count == !!partial, "public count query returned %lu, count %lu\n", err, count );
 +    err = NsiAllocateAndGetTable( 1, &NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE,
 +                                  (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
 +    ok( !err, "public enumeration returned %lu\n", err );
 +    if (!err)
 +    {
-+        ok( !count, "public enumeration returned %lu rows\n", count );
++        ok( count == !!partial, "public enumeration returned %lu rows\n", count );
 +        NsiFreeTable( keys, NULL, NULL, NULL );
 +    }
 +
@@ -2971,7 +3009,7 @@ index 12a54477f66..902073f5959 100644
 +                if (routes->Table[j].DestinationPrefix.Prefix.si_family == AF_INET &&
 +                    !routes->Table[j].DestinationPrefix.PrefixLength) ipv4 = TRUE;
 +            }
-+            ok( !ipv6, "unexpected IPv6 routes\n" );
++            ok( ipv6 == partial, "unexpected IPv6 route presence %d\n", ipv6 );
 +            ok( ipv4 == (families[i] == AF_UNSPEC), "unexpected IPv4 default route presence %d\n", ipv4 );
 +            FreeMibTable( routes );
 +        }
@@ -3094,13 +3132,13 @@ index 12a54477f66..902073f5959 100644
      test_INetworkListManager();
 +    if (dynamic_dir[0]) test_dynamic_connectivity( dynamic_dir );
 +    if (reachability_dir[0]) test_reachability( reachability_dir );
-+    if (ipv6_routes[0]) test_ipv6_route_availability( !strcmp( ipv6_routes, "unavailable" ) );
++    if (ipv6_routes[0]) test_ipv6_route_availability( ipv6_routes );
 +    if (topology_policy[0]) test_topology_policy( topology_policy );
      CoUninitialize();
  }
 diff --git a/dlls/netprofm/tests/monitor-faults.c b/dlls/netprofm/tests/monitor-faults.c
 new file mode 100644
-index 00000000000..734dfc12e7d
+index 0000000..734dfc1
 --- /dev/null
 +++ b/dlls/netprofm/tests/monitor-faults.c
 @@ -0,0 +1,394 @@
@@ -3500,7 +3538,7 @@ index 00000000000..734dfc12e7d
 +}
 diff --git a/dlls/netprofm/tests/nsi-backend.c b/dlls/netprofm/tests/nsi-backend.c
 new file mode 100644
-index 00000000000..20b2471677f
+index 0000000..20b2471
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-backend.c
 @@ -0,0 +1,104 @@
@@ -3610,7 +3648,7 @@ index 00000000000..20b2471677f
 +#endif
 diff --git a/dlls/netprofm/tests/nsi-device.c b/dlls/netprofm/tests/nsi-device.c
 new file mode 100644
-index 00000000000..5d0673cd57b
+index 0000000..5d0673c
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-device.c
 @@ -0,0 +1,200 @@
@@ -3816,7 +3854,7 @@ index 00000000000..5d0673cd57b
 +}
 diff --git a/dlls/netprofm/tests/nsi-faults.c b/dlls/netprofm/tests/nsi-faults.c
 new file mode 100644
-index 00000000000..d9172d614c7
+index 0000000..d9172d6
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-faults.c
 @@ -0,0 +1,204 @@
@@ -4026,7 +4064,7 @@ index 00000000000..d9172d614c7
 +}
 diff --git a/dlls/netprofm/tests/nsi-faults.sh b/dlls/netprofm/tests/nsi-faults.sh
 new file mode 100755
-index 00000000000..59011550582
+index 0000000..5901155
 --- /dev/null
 +++ b/dlls/netprofm/tests/nsi-faults.sh
 @@ -0,0 +1,144 @@
@@ -4176,7 +4214,7 @@ index 00000000000..59011550582
 +done
 diff --git a/dlls/netprofm/tests/reachability-network.sh b/dlls/netprofm/tests/reachability-network.sh
 new file mode 100755
-index 00000000000..5b0c54d26ff
+index 0000000..5b0c54d
 --- /dev/null
 +++ b/dlls/netprofm/tests/reachability-network.sh
 @@ -0,0 +1,274 @@
@@ -4456,7 +4494,7 @@ index 00000000000..5b0c54d26ff
 +cat "$log"
 diff --git a/dlls/netprofm/tests/topology-backend.c b/dlls/netprofm/tests/topology-backend.c
 new file mode 100644
-index 00000000000..a62eea05dd8
+index 0000000..a62eea0
 --- /dev/null
 +++ b/dlls/netprofm/tests/topology-backend.c
 @@ -0,0 +1,58 @@
@@ -4520,7 +4558,7 @@ index 00000000000..a62eea05dd8
 +#endif
 diff --git a/dlls/netprofm/tests/topology-policy.sh b/dlls/netprofm/tests/topology-policy.sh
 new file mode 100755
-index 00000000000..80eb4fe3afb
+index 0000000..80eb4fe
 --- /dev/null
 +++ b/dlls/netprofm/tests/topology-policy.sh
 @@ -0,0 +1,83 @@
@@ -4609,7 +4647,7 @@ index 00000000000..80eb4fe3afb
 +done
 diff --git a/dlls/netprofm/unixlib.c b/dlls/netprofm/unixlib.c
 new file mode 100644
-index 00000000000..0bc88a1d2bd
+index 0000000..0bc88a1
 --- /dev/null
 +++ b/dlls/netprofm/unixlib.c
 @@ -0,0 +1,520 @@
@@ -5135,7 +5173,7 @@ index 00000000000..0bc88a1d2bd
 +#endif /* _WIN64 */
 diff --git a/dlls/netprofm/unixlib.h b/dlls/netprofm/unixlib.h
 new file mode 100644
-index 00000000000..39ac542a5e3
+index 0000000..39ac542
 --- /dev/null
 +++ b/dlls/netprofm/unixlib.h
 @@ -0,0 +1,66 @@
@@ -5206,7 +5244,7 @@ index 00000000000..39ac542a5e3
 +
 +#endif /* __WINE_NETPROFM_UNIXLIB_H */
 diff --git a/dlls/nsiproxy.sys/device.c b/dlls/nsiproxy.sys/device.c
-index 28e69978250..e2402de993b 100644
+index 28e6997..e2402de 100644
 --- a/dlls/nsiproxy.sys/device.c
 +++ b/dlls/nsiproxy.sys/device.c
 @@ -49,6 +49,8 @@ DECLARE_CRITICAL_SECTION( nsiproxy_cs );
@@ -5305,7 +5343,7 @@ index 28e69978250..e2402de993b 100644
      CloseHandle( thread );
  
 diff --git a/dlls/nsiproxy.sys/ip.c b/dlls/nsiproxy.sys/ip.c
-index 002d2b48f5d..085e7f060b0 100644
+index 002d2b4..f4de880 100644
 --- a/dlls/nsiproxy.sys/ip.c
 +++ b/dlls/nsiproxy.sys/ip.c
 @@ -1558,6 +1558,7 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void
@@ -5316,29 +5354,30 @@ index 002d2b48f5d..085e7f060b0 100644
              strtoul( ptr + 1, &ptr, 16 ); /* refcount, skip */
              strtoul( ptr + 1, &ptr, 16 ); /* use, skip */
              entry.metric = strtoul( ptr + 1, &ptr, 16 );
-@@ -1783,9 +1784,9 @@ struct in6_addr str_to_in6_addr(char *nptr, char **endptr)
+@@ -1783,9 +1784,10 @@ struct in6_addr str_to_in6_addr(char *nptr, char **endptr)
      return ret;
  }
  
 -static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void *rw_data, UINT rw_size,
 -                                            void *dynamic_data, UINT dynamic_size,
 -                                            void *static_data, UINT static_size, UINT_PTR *count )
-+static NTSTATUS ipv6_forward_enumerate_all_strict( void *key_data, UINT key_size, void *rw_data, UINT rw_size,
-+                                                   void *dynamic_data, UINT dynamic_size,
-+                                                   void *static_data, UINT static_size, UINT_PTR *count )
++static NTSTATUS ipv6_forward_enumerate_all_internal( void *key_data, UINT key_size, void *rw_data, UINT rw_size,
++                                                     void *dynamic_data, UINT dynamic_size,
++                                                     void *static_data, UINT static_size, UINT_PTR *count,
++                                                     BOOL strict )
  {
      UINT num = 0;
      NTSTATUS status = STATUS_SUCCESS;
-@@ -1804,7 +1805,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
+@@ -1804,7 +1806,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
          if (!(fp = fopen( "/proc/net/ipv6_route", "r" )))
          {
              *count = 0;
 -            return STATUS_SUCCESS;
-+            return STATUS_NOT_SUPPORTED;
++            return strict ? STATUS_NOT_SUPPORTED : STATUS_SUCCESS;
          }
  
          while ((ptr = fgets( buf, sizeof(buf), fp )))
-@@ -1818,7 +1819,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
+@@ -1818,7 +1820,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
              strtoul( ptr + 1, &ptr, 16 ); /* refcount, skip */
              strtoul( ptr + 1, &ptr, 16 ); /* use, skip */
              rtf_flags = strtoul( ptr + 1, &ptr, 16);
@@ -5347,40 +5386,52 @@ index 002d2b48f5d..085e7f060b0 100644
              entry.protocol = (rtf_flags & RTF_GATEWAY) ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
              entry.loopback = entry.prefix_len == 128 && IN6_IS_ADDR_LOOPBACK(&entry.prefix);
  
-@@ -1844,7 +1845,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
+@@ -1839,12 +1841,20 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
+             }
+             num++;
+         }
++        /* A partial or failed read is not evidence that a default route is absent.
++         * Preserve public enumeration's historical partial/empty result policy. */
++        if (strict && ferror( fp ))
++        {
++            fclose( fp );
++            *count = 0;
++            return STATUS_NOT_SUPPORTED;
++        }
+         fclose(fp);
+     }
  #else
      FIXME( "not implemented\n" );
      *count = 0;
 -    return STATUS_SUCCESS;
-+    return STATUS_NOT_IMPLEMENTED;
++    return strict ? STATUS_NOT_IMPLEMENTED : STATUS_SUCCESS;
  #endif
  
      if (!want_data || num <= *count) *count = num;
-@@ -1853,6 +1854,23 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
+@@ -1853,6 +1863,22 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
      return status;
  }
  
++static NTSTATUS ipv6_forward_enumerate_all_strict( void *key_data, UINT key_size, void *rw_data, UINT rw_size,
++                                                   void *dynamic_data, UINT dynamic_size,
++                                                   void *static_data, UINT static_size, UINT_PTR *count )
++{
++    return ipv6_forward_enumerate_all_internal( key_data, key_size, rw_data, rw_size,
++                                               dynamic_data, dynamic_size, static_data, static_size, count, TRUE );
++}
++
 +static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void *rw_data, UINT rw_size,
 +                                            void *dynamic_data, UINT dynamic_size,
 +                                            void *static_data, UINT static_size, UINT_PTR *count )
 +{
-+    NTSTATUS status;
-+
-+    status = ipv6_forward_enumerate_all_strict( key_data, key_size, rw_data, rw_size,
-+                                               dynamic_data, dynamic_size, static_data, static_size, count );
-+    /* IP Helper relies on successful empty enumeration on unsupported hosts. */
-+    if (status == STATUS_NOT_SUPPORTED || status == STATUS_NOT_IMPLEMENTED)
-+    {
-+        *count = 0;
-+        return STATUS_SUCCESS;
-+    }
-+    return status;
++    return ipv6_forward_enumerate_all_internal( key_data, key_size, rw_data, rw_size,
++                                               dynamic_data, dynamic_size, static_data, static_size, count, FALSE );
 +}
 +
  static struct module_table ipv4_tables[] =
  {
      {
-@@ -1990,6 +2008,14 @@ static struct module_table ipv6_tables[] =
+@@ -1990,6 +2016,14 @@ static struct module_table ipv6_tables[] =
          },
          ipv6_forward_enumerate_all,
      },
@@ -5396,7 +5447,7 @@ index 002d2b48f5d..085e7f060b0 100644
          ~0u
      }
 diff --git a/dlls/nsiproxy.sys/ndis.c b/dlls/nsiproxy.sys/ndis.c
-index 158a39e558d..0216544cb3f 100644
+index 158a39e..0216544 100644
 --- a/dlls/nsiproxy.sys/ndis.c
 +++ b/dlls/nsiproxy.sys/ndis.c
 @@ -372,18 +372,7 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
@@ -5450,7 +5501,7 @@ index 158a39e558d..0216544cb3f 100644
  
      if (!ioctl( fd, SIOCGIFMTU, &req )) data->mtu = req.ifr_mtu;
 diff --git a/dlls/nsiproxy.sys/nsi.c b/dlls/nsiproxy.sys/nsi.c
-index 9e88a673610..748796ff72a 100644
+index 9e88a67..748796f 100644
 --- a/dlls/nsiproxy.sys/nsi.c
 +++ b/dlls/nsiproxy.sys/nsi.c
 @@ -207,7 +207,8 @@ static NTSTATUS poll_events(void)
@@ -5512,7 +5563,7 @@ index 9e88a673610..748796ff72a 100644
          }
  
 diff --git a/include/netlistmgr.idl b/include/netlistmgr.idl
-index d12b4a5f4b7..c2b22199080 100644
+index d12b4a5..c2b2219 100644
 --- a/include/netlistmgr.idl
 +++ b/include/netlistmgr.idl
 @@ -23,6 +23,14 @@ import "objidl.idl";
@@ -5537,7 +5588,7 @@ index d12b4a5f4b7..c2b22199080 100644
 +
 +} /* library NetworkListManager */
 diff --git a/include/wine/nsi.h b/include/wine/nsi.h
-index 5028bbf9e19..25626a5c18d 100644
+index 5028bbf..25626a5 100644
 --- a/include/wine/nsi.h
 +++ b/include/wine/nsi.h
 @@ -107,6 +107,11 @@ struct nsi_ndis_ifinfo_static
@@ -5552,5 +5603,3 @@ index 5028bbf9e19..25626a5c18d 100644
  struct nsi_ip_cmpt_rw
  {
      UINT not_forwarding;
--- 
-2.43.0

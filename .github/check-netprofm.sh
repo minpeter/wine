@@ -46,6 +46,8 @@ if file "$build_dir/dlls/ntdll/ntdll.so" | grep -q 'ELF 32-bit'; then
     # Give the fixture-only winegcc invocations the same tools as the Makefile.
     if [[ ! -e $build_dir/tools ]]; then
         tools_dir=$(sed -n 's/^wine64dir = //p' "$build_dir/Makefile")
+        if [[ $tools_dir != /* ]]; then tools_dir="$build_dir/$tools_dir"; fi
+        tools_dir=$(realpath "$tools_dir")
         [[ -x $tools_dir/tools/winegcc/winegcc && -x $tools_dir/tools/winebuild/winebuild ]]
         ln -s "$tools_dir/tools" "$build_dir/tools"
     fi
