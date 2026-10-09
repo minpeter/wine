@@ -9,14 +9,17 @@ AI-assisted implementation and port using Amp, authored by Woonggi Min.
 Existing copyright/LGPL notices and prerequisite attribution to Hans Leidekker
 and Paul Gofman are retained. The patch extends the reviewed
 `minpeter/wine:port/soda-11.0-10-nlm` payload with strict IPv6 stream-error
-handling, bounded Linux reachability setup and regression coverage. Its SHA256 is
-`ac985d6d500250592b1328b264c27f1970f0db8179d11f0d4047e9714fa25b75`.
+handling, bounded Linux reachability setup, complete netlink datagram reception
+and regression coverage. Its SHA256 is
+`f5f021d08efc949ef5c6424cfad6ff53c356150ca8b99b7ebc43d0ffe37a2f2a`.
 It has not been accepted upstream.
 
 ## Behavior
 
 - Linux NLM connectivity follows NSI link, address and route notifications.
   Adapter carrier and usable default routes determine topology connectivity.
+  The Linux monitor sizes each netlink datagram before receiving it, growing
+  its buffer when necessary instead of losing notifications above 4,096 bytes.
 - An optional passive NetworkManager provider can downgrade Internet status.
   It does not activate NetworkManager or initiate connectivity probes.
   Unavailable D-Bus falls back to topology, not automatic disconnection.
@@ -101,6 +104,32 @@ The application's actual loader, NLM PE/Unix library and NSI driver mappings
 were verified, along with visible compositor windows. Only its runner selection
 changed; the prior runner and a stopped-prefix backup were retained. No live
 system-bus failure or authenticated application function was exercised.
+
+The subsequent netlink fix was built without warnings in both corrected paired
+configurations. Genuine kernel multipath-route notifications at 253 nexthops
+(4,088 bytes) and 254 nexthops (4,104 bytes) passed public NSI addition/deletion
+completion and NLM LOCAL-to-INTERNET-to-LOCAL checks: 25 assertions each, zero
+failures/skips, on both architectures. The genuine prior backend passed the
+smaller boundary but failed five behavioral assertions at the larger boundary
+on both architectures. Ordinary tests and all seven fixture scripts passed in
+the complete private 11.0-10 runtime. Initial supplemental x64 cold-COM and
+provider-restart failures remain retained; clean final and genuine prior-backend
+comparisons passed under matching isolated setups, but their initial cause is
+unproven. The added allocator header does not explain those failures.
+
+The complete 11.0-28 candidate replaced only the two `nsiproxy.so` files;
+all other 4,553 regular files and 16 symlinks matched the preceding runner.
+Both architectures passed both public netlink boundary cases, ordinary
+NLM/NSI/IP Helper (87/1,807/1,111), native Bottles topology/NM (200/136), and
+direct-Wine IPv6 source modes (110/111/110/110), with zero failures/skips and
+inherited TODOs retained. An initial Bottles-adapter IPv6 invocation did not
+preserve the requested fault mode and was not accepted as validation; the
+unchanged tests were rerun directly through Wine. The prior current28 x64
+backend independently reproduced the five larger-boundary assertion failures.
+After isolated QA, a controlled application restart verified the selected
+candidate's actual loader, NLM and updated NSI mappings and a mapped compositor
+window. Only runner selection changed; the preceding runner and stopped-prefix
+backup remain available. No account content or workstation paths are published.
 
 These are composed-runtime checks, **not a fresh full current patch-stack or
 dual-architecture PGO release-build pass**. Full current-stack compilation and
