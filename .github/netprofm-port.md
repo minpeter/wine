@@ -49,10 +49,35 @@ also passed on the complete retained x64 reference build (legacy CROSS flags);
 i386 used the genuine paired-module configuration and complete private official
 11.0-10 runtime, not a full-tree rebuild or an i386 wrapper execution.
 
-These results are prior-base evidence, **not a build/runtime pass for this
-latest-Soda branch**. Full current patch-stack preparation, compilation and
-runtime QA remain pending before submission. There is no full clean
-dual-architecture release-build claim. No binary runner is included here.
+For delivery, both NSI Unix modules and updated NLM test PEs were subsequently
+rebuilt in the corrected full-ancestry paired configurations, without the legacy
+CROSS fallback. A separate candidate kept the previously verified official PGO
+11.0-28 + NLM runtime and replaced only these two Unix modules: all other 4,553
+regular files and 16 symlinks were unchanged. The module/source/paired-PE hashes,
+ELF architectures, imports and runtime dependency closure were verified.
+
+On this complete 11.0-28 candidate, both x64 and classic i386 passed ordinary
+NLM (87), NSI (1,807), IP Helper (1,111), all four IPv6 source modes
+(110/111/110/110), and native Bottles dynamic topology (200) and passive
+NetworkManager/reconnect (136), with zero failures/skips and inherited TODOs
+retained. Networking and prefixes were isolated. Original 11.0-28 NLM modules
+reproduced two real read-error assertion failures on both architectures.
+A controlled workstation restart verified the application's new runner/NLM
+mappings, the updated NSI driver module, and a visible application window;
+graphics, sync, environment and DLL overrides were preserved.
+
+These are composed-runtime checks, **not a fresh full current patch-stack or
+dual-architecture PGO release-build pass**. Full current-stack compilation and
+release validation remain pending before submission. A visible application
+window does not establish authenticated login, message delivery or suspend
+recovery. No binary runner or private workstation data is included here.
+
+## Local iteration workflow
+
+For runtime-affecting local changes: review, fix, rebuild/test a separate
+candidate, replace the local runner and verify execution, then push. Retain
+the previous runner and a stopped-prefix backup for rollback; never replace
+modules in a running runner.
 
 After building the prepared source and tests, run the focused wrapper once per
 build tree (it requires passwordless sudo and private mount/network namespaces):
