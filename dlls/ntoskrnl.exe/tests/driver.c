@@ -2696,6 +2696,131 @@ static void cancel_complete(IRP *irp)
     IoCompleteRequest(irp, IO_NO_INCREMENT);
 }
 
+static KEVENT cancel_wait_start, cancel_wait_done;
+
+/* Completes the canceled IRP and any queued async IRPs. A driver can hold a
+ * lock here that its cancel routine waits for. */
+static void WINAPI cancel_wait_thread(void *context)
+{
+    IRP *irp = context;
+    unsigned int i;
+
+    KeWaitForSingleObject(&cancel_wait_start, Executive, KernelMode, FALSE, NULL);
+
+    for (i = 0; i < queued_async_count; i++)
+        cancel_complete(queued_async_irps[i]);
+    queued_async_count = 0;
+
+    irp->IoStatus.Status = STATUS_CANCELLED;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    KeSetEvent(&cancel_wait_done, IO_NO_INCREMENT, FALSE);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static void WINAPI cancel_wait_irp(DEVICE_OBJECT *device, IRP *irp)
+{
+    LARGE_INTEGER timeout;
+    NTSTATUS ret;
+
+    IoReleaseCancelSpinLock(irp->CancelIrql);
+    KeSetEvent(&cancel_wait_start, IO_NO_INCREMENT, FALSE);
+    timeout.QuadPart = -2000 * 10000;
+    ret = KeWaitForSingleObject(&cancel_wait_done, Executive, KernelMode, FALSE, &timeout);
+    ok(!ret, "IRP completion blocked the cancel routine, ret %#lx\n", ret);
+}
+
+static NTSTATUS cancel_wait_ioctl(IRP *irp)
+{
+    KeInitializeEvent(&cancel_wait_start, NotificationEvent, FALSE);
+    KeInitializeEvent(&cancel_wait_done, NotificationEvent, FALSE);
+    ZwClose(create_thread(cancel_wait_thread, irp));
+    IoSetCancelRoutine(irp, cancel_wait_irp);
+    IoMarkIrpPending(irp);
+    return STATUS_PENDING;
+}
+
+static IRP *stale_irp, *stale_probe;
+static HANDLE stale_entered_handle, stale_canceled_handle;
+static KEVENT *stale_entered, *stale_canceled;
+static LONG stale_victim_cancels;
+static BOOL stale_reused;
+
+static void WINAPI stale_victim_cancel(DEVICE_OBJECT *device, IRP *irp)
+{
+    IoReleaseCancelSpinLock(irp->CancelIrql);
+    InterlockedIncrement(&stale_victim_cancels);
+}
+
+/* The client opens these events after this IRP returns pending. */
+static NTSTATUS stale_hold_ioctl(IRP *irp)
+{
+    UNICODE_STRING name;
+
+    RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\winetest_ntoskrnl_stale_entered");
+    stale_entered = IoCreateSynchronizationEvent(&name, &stale_entered_handle);
+    ok(stale_entered != NULL, "IoCreateSynchronizationEvent failed\n");
+    RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\winetest_ntoskrnl_stale_canceled");
+    stale_canceled = IoCreateSynchronizationEvent(&name, &stale_canceled_handle);
+    ok(stale_canceled != NULL, "IoCreateSynchronizationEvent failed\n");
+    KeClearEvent(stale_entered);
+    KeClearEvent(stale_canceled);
+
+    stale_irp = irp;
+    IoMarkIrpPending(irp);
+    return STATUS_PENDING;
+}
+
+/* On Wine this runs on the thread that dispatches cancels. Wait until the
+ * client has queued a cancel for stale_irp, then free that IRP and reuse its
+ * memory for the probe before the cancel can be dispatched. */
+static NTSTATUS stale_release_ioctl(void)
+{
+    LARGE_INTEGER timeout;
+    CCHAR stack;
+    IRP *old;
+    NTSTATUS ret;
+
+    if (!stale_irp || !stale_entered || !stale_canceled) return STATUS_INVALID_DEVICE_STATE;
+
+    KeSetEvent(stale_entered, IO_NO_INCREMENT, FALSE);
+    timeout.QuadPart = -5000 * 10000;
+    ret = KeWaitForSingleObject(stale_canceled, Executive, KernelMode, FALSE, &timeout);
+    ok(!ret, "got %#lx\n", ret);
+    ZwClose(stale_entered_handle);
+    ZwClose(stale_canceled_handle);
+    stale_entered = stale_canceled = NULL;
+
+    old = stale_irp;
+    stack = old->StackCount;
+    stale_irp = NULL;
+    cancel_complete(old);
+
+    stale_victim_cancels = 0;
+    stale_probe = IoAllocateIrp(stack, FALSE);
+    ok(stale_probe != NULL, "IoAllocateIrp failed\n");
+    if (!stale_probe) return STATUS_NO_MEMORY;
+    stale_reused = stale_probe == old;
+    IoSetCancelRoutine(stale_probe, stale_victim_cancel);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS stale_result_ioctl(IRP *irp, IO_STACK_LOCATION *stack)
+{
+    struct stale_cancel_result *result = irp->AssociatedIrp.SystemBuffer;
+
+    if (!result || stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(*result))
+        return STATUS_BUFFER_TOO_SMALL;
+    if (!stale_probe) return STATUS_INVALID_DEVICE_STATE;
+
+    result->reused = stale_reused;
+    result->victim_cancels = stale_victim_cancels;
+    IoSetCancelRoutine(stale_probe, NULL);
+    IoFreeIrp(stale_probe);
+    stale_probe = NULL;
+    irp->IoStatus.Information = sizeof(*result);
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS WINAPI driver_IoControl(DEVICE_OBJECT *device, IRP *irp)
 {
     IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
@@ -2743,6 +2868,16 @@ static NTSTATUS WINAPI driver_IoControl(DEVICE_OBJECT *device, IRP *irp)
             }
             queued_async_count = 0;
             status = STATUS_SUCCESS;
+            break;
+        case IOCTL_WINETEST_CANCEL_WAIT:
+            return cancel_wait_ioctl(irp);
+        case IOCTL_WINETEST_STALE_HOLD:
+            return stale_hold_ioctl(irp);
+        case IOCTL_WINETEST_STALE_RELEASE:
+            status = stale_release_ioctl();
+            break;
+        case IOCTL_WINETEST_STALE_RESULT:
+            status = stale_result_ioctl(irp, stack);
             break;
         case IOCTL_WINETEST_GET_CANCEL_COUNT:
             status = get_dword(irp, stack, &irp->IoStatus.Information, cancel_cnt);

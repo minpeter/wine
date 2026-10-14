@@ -81,6 +81,7 @@ struct irp_data
     IRP *irp;
     BOOL async;
     BOOL complete;
+    BOOL canceling;
 };
 
 static int wine_drivers_rb_compare( const void *key, const struct wine_rb_entry *entry )
@@ -502,6 +503,13 @@ static NTSTATUS WINAPI dispatch_irp_completion( DEVICE_OBJECT *device, IRP *irp,
     }
     SERVER_END_REQ;
 
+    if (irp_data->canceling)
+    {
+        /* dispatch_cancel frees the IRP once IoCancelIrp returns */
+        LeaveCriticalSection( &irp_completion_cs );
+        return STATUS_MORE_PROCESSING_REQUIRED;
+    }
+
     free_dispatch_irp( irp_data );
 
     LeaveCriticalSection( &irp_completion_cs );
@@ -529,6 +537,7 @@ static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_c
     irp_data->irp = irp;
     irp_data->async = FALSE;
     irp_data->complete = FALSE;
+    irp_data->canceling = FALSE;
 
     EnterCriticalSection( &irp_completion_cs );
     irp_data->cookie = ++next_irp_cookie;
@@ -855,6 +864,7 @@ static NTSTATUS dispatch_free( struct dispatch_context *context )
 static NTSTATUS dispatch_cancel( struct dispatch_context *context )
 {
     struct irp_data *irp_data;
+    IRP *irp = NULL;
 
     TRACE( "%s\n", wine_dbgstr_longlong(context->params.cancel.irp) );
 
@@ -864,10 +874,27 @@ static NTSTATUS dispatch_cancel( struct dispatch_context *context )
     LIST_FOR_EACH_ENTRY( irp_data, &dispatch_irps, struct irp_data, entry )
     {
         if (irp_data->cookie != context->params.cancel.irp) continue;
-        if (!irp_data->complete) IoCancelIrp( irp_data->irp );
-        break; /* the cancel routine may have completed and freed irp_data */
+        if (!irp_data->complete)
+        {
+            irp_data->canceling = TRUE;
+            irp = irp_data->irp;
+        }
+        break;
     }
     LeaveCriticalSection( &irp_completion_cs );
+    if (!irp) return STATUS_SUCCESS;
+
+    /* The cancel routine may wait for a thread that is completing an IRP, so
+     * call it without irp_completion_cs. Completion leaves the IRP to us. */
+    IoCancelIrp( irp );
+
+    EnterCriticalSection( &irp_completion_cs );
+    irp_data->canceling = FALSE;
+    if (irp_data->complete) free_dispatch_irp( irp_data );
+    else irp = NULL;
+    LeaveCriticalSection( &irp_completion_cs );
+
+    if (irp) IoCompleteRequest( irp, IO_NO_INCREMENT );
     return STATUS_SUCCESS;
 }
 

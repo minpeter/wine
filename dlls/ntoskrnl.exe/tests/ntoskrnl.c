@@ -723,6 +723,90 @@ static void test_overlapped(void)
     CloseHandle(file);
 }
 
+static DWORD WINAPI stale_release_thread(void *file)
+{
+    DWORD size;
+    BOOL res;
+
+    res = DeviceIoControl(file, IOCTL_WINETEST_STALE_RELEASE, NULL, 0, NULL, 0, &size, NULL);
+    ok(res, "DeviceIoControl failed: %lu\n", GetLastError());
+    return 0;
+}
+
+static void test_cancel_races(void)
+{
+    struct stale_cancel_result result;
+    OVERLAPPED overlapped, overlapped2;
+    HANDLE file, entered, canceled, thread;
+    DWORD size, ret;
+    BOOL res;
+
+    if (!pCancelIoEx)
+    {
+        win_skip("CancelIoEx is not available.\n");
+        return;
+    }
+
+    overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    overlapped2.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    file = CreateFileA("\\\\.\\WineTestDriver", FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                       0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    ok(file != INVALID_HANDLE_VALUE, "failed to open device: %lu\n", GetLastError());
+
+    /* The cancel routine waits for another thread to complete an unrelated
+     * IRP and then the canceled IRP itself. */
+    res = DeviceIoControl(file, IOCTL_WINETEST_QUEUE_ASYNC, NULL, 0, NULL, 0, NULL, &overlapped2);
+    ok(!res && GetLastError() == ERROR_IO_PENDING, "DeviceIoControl failed: %lu\n", GetLastError());
+    res = DeviceIoControl(file, IOCTL_WINETEST_CANCEL_WAIT, NULL, 0, NULL, 0, NULL, &overlapped);
+    ok(!res && GetLastError() == ERROR_IO_PENDING, "DeviceIoControl failed: %lu\n", GetLastError());
+    res = pCancelIoEx(file, &overlapped);
+    ok(res, "CancelIoEx failed: %lu\n", GetLastError());
+
+    ret = WaitForSingleObject(overlapped.hEvent, 5000);
+    ok(!ret, "got %#lx\n", ret);
+    res = GetOverlappedResult(file, &overlapped, &size, FALSE);
+    ok(!res && GetLastError() == ERROR_OPERATION_ABORTED, "got %d, error %lu\n", res, GetLastError());
+    ret = WaitForSingleObject(overlapped2.hEvent, 5000);
+    ok(!ret, "got %#lx\n", ret);
+    res = GetOverlappedResult(file, &overlapped2, &size, FALSE);
+    ok(res, "GetOverlappedResult failed: %lu\n", GetLastError());
+
+    /* A cancel queued for an IRP that completes before the cancel is
+     * dispatched must not reach a new IRP at the same address. */
+    ResetEvent(overlapped.hEvent);
+    res = DeviceIoControl(file, IOCTL_WINETEST_STALE_HOLD, NULL, 0, NULL, 0, NULL, &overlapped);
+    ok(!res && GetLastError() == ERROR_IO_PENDING, "DeviceIoControl failed: %lu\n", GetLastError());
+    entered = OpenEventA(SYNCHRONIZE, FALSE, "Global\\winetest_ntoskrnl_stale_entered");
+    canceled = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Global\\winetest_ntoskrnl_stale_canceled");
+    ok(entered && canceled, "OpenEvent failed: %lu\n", GetLastError());
+    thread = CreateThread(NULL, 0, stale_release_thread, file, 0, NULL);
+    ret = WaitForSingleObject(entered, 5000);
+    ok(!ret, "got %#lx\n", ret);
+    res = pCancelIoEx(file, &overlapped);
+    ok(res, "CancelIoEx failed: %lu\n", GetLastError());
+    SetEvent(canceled);
+    ret = WaitForSingleObject(thread, 10000);
+    ok(!ret, "got %#lx\n", ret);
+    CloseHandle(thread);
+
+    ret = WaitForSingleObject(overlapped.hEvent, 5000);
+    ok(!ret, "got %#lx\n", ret);
+    res = GetOverlappedResult(file, &overlapped, &size, FALSE);
+    ok(res, "GetOverlappedResult failed: %lu\n", GetLastError());
+
+    memset(&result, 0xcc, sizeof(result));
+    res = DeviceIoControl(device, IOCTL_WINETEST_STALE_RESULT, NULL, 0, &result, sizeof(result), &size, NULL);
+    ok(res, "DeviceIoControl failed: %lu\n", GetLastError());
+    ok(!result.victim_cancels, "stale cancel canceled the probe IRP %lu times\n", result.victim_cancels);
+    if (!result.reused) skip("The probe IRP did not reuse the freed IRP.\n");
+
+    CloseHandle(entered);
+    CloseHandle(canceled);
+    CloseHandle(overlapped.hEvent);
+    CloseHandle(overlapped2.hEvent);
+    CloseHandle(file);
+}
+
 static void test_load_driver(SC_HANDLE service)
 {
     SERVICE_STATUS status;
@@ -2583,6 +2667,7 @@ START_TEST(ntoskrnl)
     test_overlapped();
     test_load_driver(service2);
     test_file_handles();
+    test_cancel_races();
     test_return_status();
     test_object_info();
     test_blocking_irp();
