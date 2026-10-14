@@ -1,0 +1,80 @@
+From a6f71c6af3b8a541e4bdf48bba018c08946450e6 Mon Sep 17 00:00:00 2001
+From: Woonggi Min <62207008+minpeter@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 10:01:15 +0900
+Subject: [PATCH] ntoskrnl: Identify a queued IRP cancel by a cookie.
+
+A cancel can be queued after the IRP has been freed, and IoAllocateIrp can reuse that address. Match the cancel to the live dispatch entry instead of calling IoCancelIrp on the raw pointer.
+
+---
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index b3f45751b99e..d95594212746 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -75,6 +75,8 @@ static unsigned int load_image_notify_routine_count;
+ 
+ struct irp_data
+ {
++    struct list entry;
++    client_ptr_t cookie;
+     HANDLE handle;
+     IRP *irp;
+     BOOL async;
+@@ -423,11 +425,14 @@ static void *create_file_object( HANDLE handle )
+ }
+ 
+ DECLARE_CRITICAL_SECTION(irp_completion_cs);
++static struct list dispatch_irps = LIST_INIT(dispatch_irps);
++static client_ptr_t next_irp_cookie;
+ 
+ static void free_dispatch_irp( struct irp_data *irp_data )
+ {
+     IRP *irp = irp_data->irp;
+ 
++    list_remove( &irp_data->entry );
+     if (irp->UserBuffer != irp->AssociatedIrp.SystemBuffer)
+     {
+         HeapFree( GetProcessHeap(), 0, irp->UserBuffer );
+@@ -525,6 +530,11 @@ static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_c
+     irp_data->async = FALSE;
+     irp_data->complete = FALSE;
+ 
++    EnterCriticalSection( &irp_completion_cs );
++    irp_data->cookie = ++next_irp_cookie;
++    list_add_tail( &dispatch_irps, &irp_data->entry );
++    LeaveCriticalSection( &irp_completion_cs );
++
+     IoSetCompletionRoutine( irp, dispatch_irp_completion, irp_data, TRUE, TRUE, TRUE );
+     context->irp_data = irp_data;
+     context->handle = 0;
+@@ -844,12 +854,19 @@ static NTSTATUS dispatch_free( struct dispatch_context *context )
+ 
+ static NTSTATUS dispatch_cancel( struct dispatch_context *context )
+ {
+-    IRP *irp = wine_server_get_ptr( context->params.cancel.irp );
++    struct irp_data *irp_data;
+ 
+-    TRACE( "%p\n", irp );
++    TRACE( "%s\n", wine_dbgstr_longlong(context->params.cancel.irp) );
+ 
++    /* A queued cancellation can outlive the IRP. Cookies also distinguish a new
++     * IRP allocated at the same address from the canceled request. */
+     EnterCriticalSection( &irp_completion_cs );
+-    IoCancelIrp( irp );
++    LIST_FOR_EACH_ENTRY( irp_data, &dispatch_irps, struct irp_data, entry )
++    {
++        if (irp_data->cookie != context->params.cancel.irp) continue;
++        if (!irp_data->complete) IoCancelIrp( irp_data->irp );
++        break; /* the cancel routine may have completed and freed irp_data */
++    }
+     LeaveCriticalSection( &irp_completion_cs );
+     return STATUS_SUCCESS;
+ }
+@@ -960,7 +977,7 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
+             {
+                 IRP *irp = context.irp_data->irp;
+ 
+-                req->user_ptr = wine_server_client_ptr( irp );
++                req->user_ptr = context.irp_data->cookie;
+                 req->status   = status;
+ 
+                 if (context.irp_data->complete)
